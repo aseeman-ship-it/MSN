@@ -1,10 +1,12 @@
 name: lantern-binaries
 
+
+
 on:
   workflow_dispatch:
     inputs:
       radiance_ref:
-        description: "radiance branch/tag/commit (must include kindling/soar, i.e. main after 2026-10-11)"
+        description: "radiance branch/tag/commit"
         default: "main"
       package:
         description: "Go package"
@@ -15,16 +17,6 @@ on:
       socks_tag:
         description: "Tag that selects the SOCKS backend: 'novpn' on radiance main; 'stealth_novpn' only on the PR #486 branch"
         default: "novpn"
-      soar_zone:
-        description: "Soar zone delegated to YOUR soar-server, e.g. t.example.com. Empty = use the SOAR_ZONE secret; both empty = build WITHOUT Soar"
-        default: ""
-      soar_public_key:
-        description: "Soar server public key (output of: soar-server pubkey key). Empty = use the SOAR_PUBLIC_KEY repo variable or secret"
-        default: ""
-      require_soar:
-        description: "Fail the job when Soar is not linked into the core (instead of building without it)"
-        type: boolean
-        default: true
       build_armv7:
         description: "Also build armeabi-v7a (32-bit ARM). May fail, never blocks the job"
         type: boolean
@@ -47,12 +39,6 @@ env:
   TAGS: ${{ inputs.build_tags }}
   SOCKS_TAG: ${{ inputs.socks_tag }}
   PKG: ${{ inputs.package }}
-  # Soar: an input wins over the secret / variable. Resolved and validated in the "Soar settings" step.
-  IN_SOAR_ZONE: ${{ inputs.soar_zone }}
-  IN_SOAR_KEY: ${{ inputs.soar_public_key }}
-  SEC_SOAR_ZONE: ${{ secrets.SOAR_ZONE }}
-  SEC_SOAR_KEY: ${{ vars.SOAR_PUBLIC_KEY || secrets.SOAR_PUBLIC_KEY }}
-  REQUIRE_SOAR: ${{ inputs.require_soar }}
 
 jobs:
   binary:
@@ -78,67 +64,6 @@ jobs:
         run: |
           set -o pipefail
           go mod download 2>&1 | tee deps.log
-
-      # Soar is kindling's last-resort DNS-tunnel transport. It exists in a core only when the zone
-      # and the server's public key are set at LINK time:
-      #   -X github.com/getlantern/radiance/kindling/soar.Zone=<zone>
-      #   -X github.com/getlantern/radiance/kindling/soar.PublicKey=<key>
-      # Without both, kindling silently has no DNS tunnel. This step resolves them (input > secret),
-      # masks them in the log, checks that this radiance checkout really has those variables, and
-      # exports SOAR_ZONE / SOAR_KEY / SOAR_ON for the build script. The values are never written
-      # to a file that gets uploaded (see the redaction in the verify step).
-      - name: Soar settings
-        run: |
-          set +e
-          ZONE="${IN_SOAR_ZONE:-$SEC_SOAR_ZONE}"
-          KEY="${IN_SOAR_KEY:-$SEC_SOAR_KEY}"
-          # trim stray whitespace / quotes pasted along with the value
-          ZONE="$(printf '%s' "$ZONE" | tr -d ' \t\r\n"'"'"'')"
-          KEY="$(printf '%s' "$KEY" | tr -d ' \t\r\n"'"'"'')"
-          [ -n "$ZONE" ] && echo "::add-mask::$ZONE"
-          [ -n "$KEY" ] && echo "::add-mask::$KEY"
-
-          on=1
-          if [ -z "$ZONE" ] || [ -z "$KEY" ]; then
-            on=0
-            echo "::warning::Soar zone and/or public key not provided: the core will be built WITHOUT the DNS tunnel."
-          fi
-          if [ "$on" = 1 ]; then
-            if ! printf '%s' "$ZONE" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$'; then
-              echo "::error::soar_zone is not a valid DNS name (expected something like t.example.com)"; on=0; BAD=1
-            fi
-            # -X values are split on spaces by the linker; the key must be one token.
-            LEN="$(printf '%s' "$KEY" | base64 -d 2>/dev/null | wc -c)"
-            if [ "$LEN" != 32 ]; then
-              echo "::warning::the public key does not decode (base64) to 32 bytes (got $LEN). If 'soar-server pubkey' prints another format, check radiance's kindling/soar/soar.go before trusting this build."
-            fi
-          fi
-          if [ "$on" = 1 ]; then
-            if [ ! -f kindling/soar/soar.go ] || ! grep -Eq 'Zone|PublicKey' kindling/soar/soar.go; then
-              echo "::error::this radiance ref has no kindling/soar (Zone/PublicKey variables). Use main from 2026-10-11 or later."
-              on=0; BAD=1
-            fi
-          fi
-          {
-            echo "## kindling/soar variables in this checkout"
-            grep -n -E '^\s*(var\s+)?(Zone|PublicKey)\b' kindling/soar/soar.go 2>&1 | head -10
-            echo "## soar version in go.mod"
-            grep -n 'getlantern/soar' go.mod 2>&1
-          } > soar-facts.txt 2>&1
-          cat soar-facts.txt
-
-          if [ "$on" = 1 ]; then
-            echo "SOAR_ON=1" >> "$GITHUB_ENV"
-            echo "SOAR_ZONE=$ZONE" >> "$GITHUB_ENV"
-            echo "SOAR_KEY=$KEY" >> "$GITHUB_ENV"
-            echo "Soar will be linked into every core."
-          else
-            echo "SOAR_ON=0" >> "$GITHUB_ENV"
-            if [ "$REQUIRE_SOAR" = "true" ]; then
-              echo "::error::require_soar is on but Soar cannot be linked (see messages above). Fix the inputs, or untick require_soar to build without it."
-              exit 1
-            fi
-          fi
 
       # Read-only facts about this exact radiance checkout: which files the SOCKS tag
       # gates, and what the SOCKS backend does. Uploaded as source-facts.txt.
@@ -211,9 +136,6 @@ jobs:
       # standalone) in case the SOCKS branch does not compile with them. The tag set that
       # worked for the first ABI (arm64-v8a) is recorded in USED_TAGS and tried first for the
       # next ABIs. No -v: it prints every package name and buries the one error line.
-      # When SOAR_ON=1 the two -X flags are added to -ldflags (before -linkmode, so the quoted
-      # -extldflags stays last). -X only works on string VARIABLES, which is what
-      # kindling/soar.Zone and kindling/soar.PublicKey are.
       - name: Prepare build helper
         run: |
           cat > ci-build-core.sh <<'EOF'
@@ -235,15 +157,10 @@ jobs:
           OUT="out/$ABI/liblantern_novpn.so"
           mkdir -p "out/$ABI"
 
-          SOARX=""
-          if [ "${SOAR_ON:-0}" = 1 ]; then
-            SOARX="-X github.com/getlantern/radiance/kindling/soar.Zone=${SOAR_ZONE} -X github.com/getlantern/radiance/kindling/soar.PublicKey=${SOAR_KEY}"
-          fi
-
           build_core() {  # $1 tags, $2 log file
             CGO_ENABLED=1 GOOS=android GOARCH="$GOARCH_" GOARM="$GOARM_" CC="$CC_BIN" CXX="$CXX_BIN" \
             go build -trimpath -buildmode=pie -tags "$1" \
-              -ldflags "-s -w -checklinkname=0 $SOARX -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ $PAGE'" \
+              -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ $PAGE'" \
               -o "$OUT" "$PKG" > "$2" 2>&1
           }
 
@@ -256,7 +173,7 @@ jobs:
             name="${attempt%%|*}"; tags="${attempt#*|}"
             # do not retry the same tag set twice
             if [ "$name" = slim ] && [ "$tags" = "$FIRST" ]; then continue; fi
-            echo "::group::$ABI attempt $name  tags=$tags  soar=${SOAR_ON:-0}"
+            echo "::group::$ABI attempt $name  tags=$tags"
             if build_core "$tags" "build-$ABI-$name.log"; then
               echo "built OK"
               echo "$tags" > "out/$ABI/.used_tags"
@@ -300,10 +217,7 @@ jobs:
       # Proof from each finished binary, not from the command line:
       #  - the Go build info must list the SOCKS tag
       #  - the TUN option builder (boxoptions_default.go) must not be linked in
-      #  - when Soar was requested, the build info must carry both soar.Zone= and soar.PublicKey=
-      #    with a value (this is exactly what the app reads to show "Built in · standby")
       # core-info.txt carries the sha256: the app prints the first 16 hex digits in its log.
-      # The Soar zone and key are REDACTED in core-info.txt, which is uploaded as an artifact.
       # Every binary that exists is checked; one bad binary fails the whole step, so a
       # wrong core can never be published next to the good ones.
       - name: Verify every core is the SOCKS build
@@ -313,8 +227,8 @@ jobs:
           : > core-info.txt
           {
             echo "### Core check"
-            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` in build info | TUN builder linked (must be 0) | SOCKS builder linked | Soar zone+key linked | sha256 (first 16) |"
-            echo "|---|---|---|---|---|---|"
+            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` in build info | TUN builder linked (must be 0) | SOCKS builder linked | sha256 (first 16) |"
+            echo "|---|---|---|---|---|"
           } | tee -a "$GITHUB_STEP_SUMMARY"
           bad=0
           found=0
@@ -322,28 +236,17 @@ jobs:
             [ -f "$f" ] || continue
             found=$((found+1))
             abi="$(basename "$(dirname "$f")")"
-            INFO="$(go version -m "$f" 2>&1)"
             {
               echo "=================== $abi"
               echo "file: $f"; sha256sum "$f"; ls -l "$f"; file "$f"
               echo "used tags: $(cat "out/$abi/.used_tags" 2>/dev/null)"
-              printf '%s\n' "$INFO" | sed -E 's/(soar\.Zone=)[^ "'"'"']+/\1<redacted>/g; s/(soar\.PublicKey=)[^ "'"'"']+/\1<redacted>/g'
+              go version -m "$f"
             } >> core-info.txt 2>&1
             has_tag=0
-            if printf '%s\n' "$INFO" | grep -E 'build[[:space:]]+-tags=' | sed 's/.*-tags=//' | tr ',' '\n' | grep -qx "$SOCKS_TAG"; then has_tag=1; fi
+            if go version -m "$f" | grep -E 'build[[:space:]]+-tags=' | sed 's/.*-tags=//' | tr ',' '\n' | grep -qx "$SOCKS_TAG"; then has_tag=1; fi
             tun_refs="$(strings -a "$f" | grep -c 'boxoptions_default.go' || true)"
             socks_refs="$(strings -a "$f" | grep -c 'boxoptions_novpn.go' || true)"
-            soar_ok="n/a"
-            if [ "${SOAR_ON:-0}" = 1 ]; then
-              if printf '%s\n' "$INFO" | grep -Eq 'soar\.Zone=[^ "'"'"']+' && printf '%s\n' "$INFO" | grep -Eq 'soar\.PublicKey=[^ "'"'"']+'; then
-                soar_ok=yes
-              else
-                soar_ok=NO
-                echo "::error::$abi: Soar was requested but soar.Zone/soar.PublicKey are not in the build info (stripped build, or the variable names changed in this radiance ref)"
-                bad=1
-              fi
-            fi
-            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | $soar_ok | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
             if [ "$has_tag" != 1 ] || [ "$tun_refs" != 0 ]; then
               echo "::error::$abi liblantern_novpn.so is NOT a SOCKS-only build (tag present: $has_tag, TUN code references: $tun_refs)"
               bad=1
@@ -353,7 +256,7 @@ jobs:
           if [ "$found" = 0 ]; then echo "::error::no core was built"; exit 1; fi
           if [ ! -f out/arm64-v8a/liblantern_novpn.so ]; then echo "::error::the required arm64-v8a core is missing"; exit 1; fi
           if [ "$bad" != 0 ]; then exit 1; fi
-          echo "all $found core(s) OK: SOCKS-only build (Soar linked: ${SOAR_ON:-0})"
+          echo "all $found core(s) OK: SOCKS-only build"
 
       # Opt-in only. The TUN build cannot run in the app (needs netlink), and shipping it
       # next to the SOCKS one invites a silent fallback to the wrong core.
@@ -366,13 +269,9 @@ jobs:
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           CC_BIN="$TC/aarch64-linux-android24-clang"
           CXX_BIN="$TC/aarch64-linux-android24-clang++"
-          SOARX=""
-          if [ "${SOAR_ON:-0}" = 1 ]; then
-            SOARX="-X github.com/getlantern/radiance/kindling/soar.Zone=${SOAR_ZONE} -X github.com/getlantern/radiance/kindling/soar.PublicKey=${SOAR_KEY}"
-          fi
           CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$CC_BIN" CXX="$CXX_BIN" \
           go build -trimpath -buildmode=pie -tags "$TAGS" \
-            -ldflags "-s -w -checklinkname=0 $SOARX -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
+            -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ -Wl,-z,max-page-size=16384'" \
             -o out/arm64-v8a/liblantern.so "$PKG" 2>&1 | tee build-arm64-default.log
 
       - name: What was produced
@@ -381,15 +280,12 @@ jobs:
           rm -f out/*/.used_tags
           ls -lh out/*/ 2>/dev/null || echo "nothing in out/"
 
-      # build-*.log and deps.log never contain the zone or key (they are only passed to the linker),
-      # and GitHub masks both values in the job log anyway.
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: lantern-report-and-logs
           path: |
             source-facts.txt
-            soar-facts.txt
             patch-log.txt
             patch-before.txt
             core-info.txt
