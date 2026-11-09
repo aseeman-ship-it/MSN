@@ -1,13 +1,30 @@
 name: lantern-binaries
 
-
+# Builds the SOCKS-only Lantern core (liblantern_novpn.so) for the app.
+#
+# What changed compared with the previous version:
+#  1. lantern_box_version (optional): pin lantern-box. The core you shipped in October carried
+#     lantern-box v0.0.140. Later releases fix exactly the "stall, then the ladder picks the same
+#     bad server again" behaviour (v0.0.144 "switch off members that fail confirmation", v0.0.151,
+#     v0.0.170, v0.0.171 "reduce server flapping"), so rebuild with a newer one.
+#  2. Build identity: version / build time / commit are injected with -X, when this radiance
+#     checkout has those variables, so the daemon log says which build it is (it said version=dev).
+#  3. Soar: radiance replaced the old dnstt tunnel with Soar. A Soar client needs a zone and a
+#     server public key at build time. This workflow finds the variables by itself, injects YOUR
+#     zone / key when you provide them (secrets SOAR_ZONE / SOAR_PUBLIC_KEY, or the inputs) and
+#     writes soar-facts.txt so you can see what exists in this exact checkout. Without values the
+#     core is built exactly as before.
+#  4. Versions of the load-bearing modules are listed in the job summary and in soar-facts.txt.
 
 on:
   workflow_dispatch:
     inputs:
       radiance_ref:
-        description: "radiance branch/tag/commit"
+        description: "radiance branch/tag/commit (use a commit SHA once you have a build you trust)"
         default: "main"
+      lantern_box_version:
+        description: "Optional: force a lantern-box version, e.g. v0.0.171. Empty = whatever radiance pins"
+        default: ""
       package:
         description: "Go package"
         default: "./cmd/lanternd"
@@ -17,6 +34,12 @@ on:
       socks_tag:
         description: "Tag that selects the SOCKS backend: 'novpn' on radiance main; 'stealth_novpn' only on the PR #486 branch"
         default: "novpn"
+      soar_zone:
+        description: "Optional Soar zone (your own soar-server -zone). Prefer the SOAR_ZONE secret"
+        default: ""
+      soar_public_key:
+        description: "Optional Soar server public key. Prefer the SOAR_PUBLIC_KEY secret"
+        default: ""
       build_armv7:
         description: "Also build armeabi-v7a (32-bit ARM). May fail, never blocks the job"
         type: boolean
@@ -60,6 +83,15 @@ jobs:
           git config --global url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
           echo "GOPRIVATE=github.com/getlantern/*" >> $GITHUB_ENV
 
+      - name: Pin lantern-box (optional)
+        if: ${{ inputs.lantern_box_version != '' }}
+        env:
+          LB_VER: ${{ inputs.lantern_box_version }}
+        run: |
+          set -o pipefail
+          go get "github.com/getlantern/lantern-box@${LB_VER}" 2>&1 | tee lb-pin.log
+          echo "lantern-box pinned to ${LB_VER}" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Download modules
         run: |
           set -o pipefail
@@ -86,6 +118,40 @@ jobs:
           cat source-facts.txt
           echo "::endgroup::"
 
+      # Facts about the modules that decide how the core behaves under load: the auto-select
+      # group (stall handling) and the DNS tunnel (Soar / dnstt). Nothing here changes the build.
+      - name: Module facts (auto-select, Soar)
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## versions"
+            go list -m github.com/getlantern/radiance github.com/getlantern/lantern-box github.com/getlantern/kindling github.com/getlantern/soar github.com/getlantern/dnstt github.com/sagernet/sing-box 2>&1
+            LB="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/getlantern/lantern-box 2>/dev/null)"
+            echo; echo "## lantern-box auto-select files ($LB)"
+            ls "$LB/protocol/group" 2>&1 | grep -i -E 'autoselect|history|dataplane|probe'
+            echo; echo "## stall / confirmation / recovery-gate handling in auto-select"
+            grep -n -i -E 'stall|confirm|recovery|gate|ladder|excluding' "$LB"/protocol/group/mutableautoselect*.go 2>/dev/null | grep -v _test | head -80
+            echo; echo "## files that mention soar (radiance)"
+            grep -rli soar --include=*.go . | head -40
+            echo; echo "## string variables with an empty default in soar-related files (ldflags -X candidates)"
+            for root in . "$(go list -m -f '{{.Dir}}' github.com/getlantern/kindling 2>/dev/null)" "$(go list -m -f '{{.Dir}}' github.com/getlantern/soar 2>/dev/null)"; do
+              [ -d "$root" ] || continue
+              grep -rliE soar --include=*.go "$root" 2>/dev/null | grep -v _test.go | while read -r f; do
+                grep -nHE '^[[:space:]]*(var[[:space:]]+)?[A-Za-z_]+[[:space:]]+(string[[:space:]]*)?=[[:space:]]*""' "$f"
+              done
+            done | head -40
+          } > soar-facts.txt 2>&1
+          echo "::group::soar-facts.txt"
+          cat soar-facts.txt
+          echo "::endgroup::"
+          {
+            echo "### Linked modules"
+            echo '```'
+            go list -m github.com/getlantern/radiance github.com/getlantern/lantern-box github.com/getlantern/kindling github.com/getlantern/soar github.com/getlantern/dnstt 2>&1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Locate NDK
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
@@ -93,11 +159,86 @@ jobs:
           echo "NDK=$NDK" >> $GITHUB_ENV
           test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
 
+      # Builds XFLAGS (extra -X linker flags):
+      #  - build identity (Version / BuildTime / Commit) when common/ declares those variables
+      #  - Soar zone + public key, only when YOU provided both AND the variables were found
+      # Values are masked in the log and never printed. Nothing is invented: a variable that is
+      # not found is simply skipped and reported.
+      - name: Discover ldflags (build identity + Soar)
+        env:
+          SOAR_ZONE: ${{ secrets.SOAR_ZONE || inputs.soar_zone }}
+          SOAR_PUBKEY: ${{ secrets.SOAR_PUBLIC_KEY || inputs.soar_public_key }}
+        run: |
+          set +e
+          [ -n "$SOAR_ZONE" ] && echo "::add-mask::$SOAR_ZONE"
+          [ -n "$SOAR_PUBKEY" ] && echo "::add-mask::$SOAR_PUBKEY"
+          MOD="$(go list -m -f '{{.Path}}')"
+          SHORT="$(git rev-parse --short=10 HEAD)"
+          NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          XF=""
+
+          has_var() {  # $1 = file glob, $2 = variable name
+            grep -hE "^[[:space:]]*(var[[:space:]]+)?$2[[:space:]]+(string[[:space:]]*)?=" $1 >/dev/null 2>&1
+          }
+          for spec in "Version=nana-${SHORT}" "BuildTime=${NOW}" "Commit=${SHORT}"; do
+            n="${spec%%=*}"; v="${spec#*=}"
+            if has_var "common/*.go" "$n"; then
+              XF="$XF -X $MOD/common.$n=$v"
+              echo "identity: $MOD/common.$n set"
+            else
+              echo "identity: common.$n not declared in this checkout, skipped"
+            fi
+          done
+
+          # Finds "import/path.VarName" of the first string variable matching $1 in a file that
+          # mentions soar, searching radiance, kindling, soar and lantern-box.
+          find_soar_var() {
+            for entry in ".|$MOD" \
+              "$(go list -m -f '{{.Dir}}' github.com/getlantern/kindling 2>/dev/null)|github.com/getlantern/kindling" \
+              "$(go list -m -f '{{.Dir}}' github.com/getlantern/soar 2>/dev/null)|github.com/getlantern/soar" \
+              "$(go list -m -f '{{.Dir}}' github.com/getlantern/lantern-box 2>/dev/null)|github.com/getlantern/lantern-box"; do
+              dir="${entry%%|*}"; mp="${entry#*|}"
+              [ -d "$dir" ] || continue
+              grep -rlE "^[[:space:]]*(var[[:space:]]+)?($1)[[:space:]]+(string[[:space:]]*)?=" --include=*.go "$dir" 2>/dev/null | grep -v _test.go | while read -r f; do
+                if echo "$f" | grep -qi soar || grep -qi soar "$f"; then
+                  rel="$(dirname "${f#"$dir"/}")"
+                  pkg="$mp"; [ "$rel" != "." ] && pkg="$mp/$rel"
+                  name="$(grep -ohE "^[[:space:]]*(var[[:space:]]+)?($1)" "$f" | head -1 | sed -E 's/^[[:space:]]*(var[[:space:]]+)?//')"
+                  echo "$pkg.$name"
+                fi
+              done
+            done | head -1
+          }
+
+          SOAR_INJECTED=0
+          if [ -n "$SOAR_ZONE" ] && [ -n "$SOAR_PUBKEY" ]; then
+            ZV="$(find_soar_var 'Zone|SoarZone')"
+            KV="$(find_soar_var 'PublicKey|PubKey|SoarPublicKey')"
+            echo "soar zone variable:       ${ZV:-NOT FOUND}"
+            echo "soar public key variable: ${KV:-NOT FOUND}"
+            if [ -n "$ZV" ] && [ -n "$KV" ]; then
+              XF="$XF -X $ZV=$SOAR_ZONE -X $KV=$SOAR_PUBKEY"
+              SOAR_INJECTED=1
+              echo "Soar zone and key will be linked into the core" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::warning::Soar values were given but the variables were not found. Read soar-facts.txt (last section lists the candidates) and send it to me."
+            fi
+          else
+            echo "No Soar values given: Soar is built exactly as upstream does it (disabled unless upstream embeds its own)."
+          fi
+
+          echo "XFLAGS=$XF" >> "$GITHUB_ENV"
+          echo "SOAR_INJECTED=$SOAR_INJECTED" >> "$GITHUB_ENV"
+
       # Run #11 proved the SOCKS branch is in the binary, yet connect still died on Android with
       # "create network monitor: netlink socket in Android is banned by Google". sing-box treats
       # a failing network monitor as fatal only when route.auto_detect_interface is on. A SOCKS-only
       # core has nothing to detect (the app excludes its own UID from the TUN), so the monitor
       # failure must be non-fatal. Two independent patches; each one prints what it did.
+      #
+      # Side effect to remember: with no interface monitor the daemon does not notice a Wi-Fi <->
+      # mobile switch by itself. The app compensates (LanternManager.onNetworkChanged: probe, then
+      # re-issue connect, then relaunch the daemon).
       - name: Patch - no fatal netlink network monitor
         run: |
           set +e
@@ -136,6 +277,7 @@ jobs:
       # standalone) in case the SOCKS branch does not compile with them. The tag set that
       # worked for the first ABI (arm64-v8a) is recorded in USED_TAGS and tried first for the
       # next ABIs. No -v: it prints every package name and buries the one error line.
+      # XFLAGS (build identity, Soar) comes from the "Discover ldflags" step.
       - name: Prepare build helper
         run: |
           cat > ci-build-core.sh <<'EOF'
@@ -160,7 +302,7 @@ jobs:
           build_core() {  # $1 tags, $2 log file
             CGO_ENABLED=1 GOOS=android GOARCH="$GOARCH_" GOARM="$GOARM_" CC="$CC_BIN" CXX="$CXX_BIN" \
             go build -trimpath -buildmode=pie -tags "$1" \
-              -ldflags "-s -w -checklinkname=0 -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ $PAGE'" \
+              -ldflags "-s -w -checklinkname=0 ${XFLAGS:-} -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ $PAGE'" \
               -o "$OUT" "$PKG" > "$2" 2>&1
           }
 
@@ -217,18 +359,21 @@ jobs:
       # Proof from each finished binary, not from the command line:
       #  - the Go build info must list the SOCKS tag
       #  - the TUN option builder (boxoptions_default.go) must not be linked in
+      #  - when Soar values were linked, the zone must be present in the binary (warning only)
       # core-info.txt carries the sha256: the app prints the first 16 hex digits in its log.
       # Every binary that exists is checked; one bad binary fails the whole step, so a
       # wrong core can never be published next to the good ones.
       - name: Verify every core is the SOCKS build
         id: verify
         continue-on-error: true
+        env:
+          SOAR_ZONE: ${{ secrets.SOAR_ZONE || inputs.soar_zone }}
         run: |
           : > core-info.txt
           {
             echo "### Core check"
-            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` in build info | TUN builder linked (must be 0) | SOCKS builder linked | sha256 (first 16) |"
-            echo "|---|---|---|---|---|"
+            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` in build info | TUN builder linked (must be 0) | SOCKS builder linked | Soar zone linked | sha256 (first 16) |"
+            echo "|---|---|---|---|---|---|"
           } | tee -a "$GITHUB_STEP_SUMMARY"
           bad=0
           found=0
@@ -246,7 +391,11 @@ jobs:
             if go version -m "$f" | grep -E 'build[[:space:]]+-tags=' | sed 's/.*-tags=//' | tr ',' '\n' | grep -qx "$SOCKS_TAG"; then has_tag=1; fi
             tun_refs="$(strings -a "$f" | grep -c 'boxoptions_default.go' || true)"
             socks_refs="$(strings -a "$f" | grep -c 'boxoptions_novpn.go' || true)"
-            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
+            soar_state="n/a"
+            if [ "${SOAR_INJECTED:-0}" = 1 ] && [ -n "$SOAR_ZONE" ]; then
+              if strings -a "$f" | grep -qF -- "$SOAR_ZONE"; then soar_state="yes"; else soar_state="NOT FOUND"; echo "::warning::$abi: the Soar zone was passed to the linker but is not visible in the binary (the variable may be unused or stored differently)"; fi
+            fi
+            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | $soar_state | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
             if [ "$has_tag" != 1 ] || [ "$tun_refs" != 0 ]; then
               echo "::error::$abi liblantern_novpn.so is NOT a SOCKS-only build (tag present: $has_tag, TUN code references: $tun_refs)"
               bad=1
@@ -286,10 +435,12 @@ jobs:
           name: lantern-report-and-logs
           path: |
             source-facts.txt
+            soar-facts.txt
             patch-log.txt
             patch-before.txt
             core-info.txt
             deps.log
+            lb-pin.log
             build-*.log
           if-no-files-found: ignore
 
