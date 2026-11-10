@@ -110,6 +110,9 @@ jobs:
             echo; echo "## vpn/ files that mention novpn"; ls vpn | grep -i novpn
             echo; echo "## vpn/boxoptions_novpn.go"; cat vpn/boxoptions_novpn.go 2>&1
             echo; echo "## vpn/boxoptions_default.go (first 25 lines)"; sed -n '1,25p' vpn/boxoptions_default.go 2>&1
+            echo; echo "## where the config request gets its 'platform' (HTTP 400: bad client factors: getting platform)"
+            grep -rn "getting platform\|bad client factors" --include=*.go . | grep -v _test.go | head -20
+            grep -rn "func .*[Pp]latform()" --include=*.go common config | head -20
             echo; echo "## who reads RADIANCE_SOCKS_ADDRESS / device id"
             grep -rn "RADIANCE_SOCKS_ADDRESS\|RADIANCE_USE_SOCKS_PROXY\|RADIANCE_DEVICE_ID" --include=*.go . | head -20
             grep -rn "DeviceIDKey" --include=*.go common/settings | head -10
