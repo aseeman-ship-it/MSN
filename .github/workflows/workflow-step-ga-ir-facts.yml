@@ -1,0 +1,19 @@
+# Add this step after "Module facts (auto-select, Soar)". Read-only: it only prints where
+      # the DNS rules and the "ga-ir" rule-set come from, so the next change can be exact.
+      - name: Facts - DNS rules and rule-set ga-ir
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## ga-ir / geoip rule-set references"
+            grep -rn -E 'ga-ir|geoip-ir|ga_ir' --include=*.go . | grep -v _test.go | head -40
+            LB="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/getlantern/lantern-box 2>/dev/null)"
+            [ -d "$LB" ] && grep -rn -E 'ga-ir|geoip-ir|ga_ir' --include=*.go "$LB" | grep -v _test.go | head -40
+            echo; echo "## where DNS rules are built (query_type / rule_set / match_response / evaluate)"
+            grep -rn -E 'DNSRule|DefaultDNSRule|QueryType|MatchResponse|"evaluate"' --include=*.go vpn config 2>/dev/null | grep -v _test.go | head -60
+            [ -d "$LB" ] && grep -rn -E 'DNSRule|QueryType|MatchResponse|"evaluate"' --include=*.go "$LB" | grep -v _test.go | head -60
+            echo; echo "## newest lantern-box tags"
+            go list -m -versions github.com/getlantern/lantern-box | tr ' ' '\n' | tail -8
+          } > dns-facts.txt 2>&1
+          echo "::group::dns-facts.txt"; cat dns-facts.txt; echo "::endgroup::"
+      # ...and add "dns-facts.txt" to the paths of the lantern-report-and-logs upload.
