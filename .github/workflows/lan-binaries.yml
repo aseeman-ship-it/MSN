@@ -53,6 +53,9 @@ on:
       soar_public_key:
         description: "Optional Soar server public key. Prefer the SOAR_PUBLIC_KEY secret"
         default: ""
+      dns_drop_rulesets:
+        description: "Comma separated rule-set tags whose DNS rules are dropped at sing-box level (sing-box 1.14 rejects them: 'Legacy Address Filter Fields'). Empty = no patch"
+        default: "ga-ir"
       inject_version:
         description: "Also inject common.Version (nana-<commit>). Off by default: the server may read the client version"
         type: boolean
@@ -83,6 +86,7 @@ env:
   LB_TRY: ${{ inputs.lantern_box_candidates }}
   # go get / go mod edit change go.mod and go.sum; builds must be allowed to follow them.
   GOFLAGS: -mod=mod
+  DNS_DROP: ${{ inputs.dns_drop_rulesets }}
 
 jobs:
   binary:
@@ -161,6 +165,94 @@ jobs:
           EOF
           chmod +x patch-netmon.sh
 
+          # ---- patch-dnsrules.sh ----------------------------------------------------------
+          # Field log: "fetch rule-set ga-ir : validate dns rule[3]: Legacy Address Filter Fields in
+          # DNS rules is deprecated". The tag ga-ir is not in radiance or lantern-box: it comes from
+          # the config server. sing-box 1.14 rejects a DNS rule that points at an IP-only rule-set
+          # while the DNS rules also use query_type (radiance adds those itself), so the rule-set
+          # never loads, every start waits ~10 s for it and the fetch fails again.
+          # In a SOCKS-only core the DNS rule that uses ga-ir has no job, so it is dropped where
+          # sing-box builds its DNS router (it is the single consumer, so it also covers rules that
+          # arrive from the config later). The result is compiled right away; if it does not compile
+          # the patch is reverted and the build goes on unpatched.
+          cat > patch-dnsrules.sh <<'EOF'
+          #!/usr/bin/env bash
+          set +e
+          DROP="${DNS_DROP:-}"
+          if [ -z "$DROP" ]; then echo "dns_drop_rulesets is empty: no DNS patch"; exit 0; fi
+          D="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/sagernet/sing-box)"
+          F="$D/dns/router.go"
+          echo "sing-box dir: $D"
+          echo "rule-set tags to drop from DNS rules: $DROP"
+          if [ ! -f "$F" ]; then echo "::warning::$F not found, DNS patch skipped"; exit 0; fi
+          chmod -R u+w "$D" 2>/dev/null
+          if grep -q 'dnsfixDropRules' "$F"; then echo "sing-box dns router already patched"; exit 0; fi
+          echo "-- NewRouter before:"
+          grep -n -A3 'func NewRouter' "$F" | head -12
+          cp "$F" "$F.dnsfix.bak"
+          cat > "$D/dns/zz_dnsfix.go" <<'GOEOF'
+          package dns
+
+          import (
+          	"strings"
+
+          	"github.com/sagernet/sing-box/option"
+          )
+
+          var dnsfixTags = func() map[string]bool {
+          	m := map[string]bool{}
+          	for _, t := range strings.Split("__DROP__", ",") {
+          		if t = strings.TrimSpace(t); t != "" {
+          			m[t] = true
+          		}
+          	}
+          	return m
+          }()
+
+          func dnsfixMatch(r option.DNSRule) bool {
+          	if r.Type == "logical" {
+          		for _, sub := range r.LogicalOptions.Rules {
+          			if dnsfixMatch(sub) {
+          				return true
+          			}
+          		}
+          		return false
+          	}
+          	for _, tag := range r.DefaultOptions.RuleSet {
+          		if dnsfixTags[tag] {
+          			return true
+          		}
+          	}
+          	return false
+          }
+
+          func dnsfixDropRules(rules []option.DNSRule) []option.DNSRule {
+          	out := make([]option.DNSRule, 0, len(rules))
+          	for _, r := range rules {
+          		if !dnsfixMatch(r) {
+          			out = append(out, r)
+          		}
+          	}
+          	return out
+          }
+          GOEOF
+          sed -i "s|__DROP__|$DROP|" "$D/dns/zz_dnsfix.go"
+          perl -0pi -e 's/(func NewRouter\([^{]*\{\n)/$1\toptions.Rules = dnsfixDropRules(options.Rules)\n/' "$F"
+          if ! grep -q 'options.Rules = dnsfixDropRules' "$F"; then
+            echo "::warning::could not find 'func NewRouter(...) {' in dns/router.go; DNS patch reverted"
+            cp "$F.dnsfix.bak" "$F"; rm -f "$D/dns/zz_dnsfix.go"; exit 0
+          fi
+          if go build -tags "$TAGS,$SOCKS_TAG" github.com/sagernet/sing-box/dns > dnsfix-compile.log 2>&1; then
+            echo "PATCHED sing-box dns router: DNS rules that use [$DROP] are dropped"
+            grep -n -A3 'func NewRouter' "$F" | head -8
+          else
+            echo "::warning::DNS patch did not compile; reverted. Send patch-dns-log.txt"
+            tail -30 dnsfix-compile.log
+            cp "$F.dnsfix.bak" "$F"; rm -f "$D/dns/zz_dnsfix.go"
+          fi
+          EOF
+          chmod +x patch-dnsrules.sh
+
           # ---- ci-build-core.sh -----------------------------------------------------------
           #   ./ci-build-core.sh <abi>      abi = arm64-v8a | armeabi-v7a | x86_64 | x86
           # Attempts: the full tag set (or the one that worked for the first ABI), then a slimmer
@@ -224,6 +316,7 @@ jobs:
             cp go.sum.upstream go.sum
             go mod download 2>&1 | tail -5
             ./patch-netmon.sh > patch-log-fallback.txt 2>&1 || true
+            ./patch-dnsrules.sh > patch-dns-fallback.txt 2>&1 || true
             NEW_LB="$(go list -m -f '{{.Version}}' github.com/getlantern/lantern-box)"
             echo "LB_EXPECT=$NEW_LB" >> "$GITHUB_ENV"
             echo "LB_PINNED=0" >> "$GITHUB_ENV"
@@ -519,6 +612,9 @@ jobs:
       - name: Patch - no fatal netlink network monitor
         run: ./patch-netmon.sh 2>&1 | tee patch-log.txt
 
+      - name: Patch - drop DNS rules that sing-box 1.14 rejects (ga-ir)
+        run: ./patch-dnsrules.sh 2>&1 | tee patch-dns-log.txt
+
       - name: Build arm64-v8a SOCKS core -> liblantern_novpn.so (required)
         run: ./ci-build-core.sh arm64-v8a
 
@@ -630,6 +726,9 @@ jobs:
             dns-facts.txt
             patch-log.txt
             patch-log-fallback.txt
+            patch-dns-log.txt
+            patch-dns-fallback.txt
+            dnsfix-compile.log
             core-info.txt
             go-mod.diff
             deps.log
