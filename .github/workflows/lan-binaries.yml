@@ -2,32 +2,29 @@ name: lantern-binaries
 
 # Builds the SOCKS-only Lantern core (liblantern_novpn.so) for the app.
 #
-# What changed compared with the previous version (and why):
+# Place this file at:  .github/workflows/lantern-binaries.yml
 #
-#  1. lantern-box is no longer left to chance.  The in-app log of 2026-11-22 still says
-#     "lantern-box v0.0.140 ... rev=992e315bbc time=2026-10-11 ... version=dev": the core that
-#     was running is the October build, none of the later auto-select fixes were in it.
-#     Now the default is  lantern_box_version = auto :
+# What this version does:
+#
+#  1. lantern-box pin ladder (lantern_box_version = auto):
 #        - take the N newest lantern-box tags (lantern_box_candidates, default 4),
 #        - keep only the ones NEWER than what radiance pins,
 #        - for each (newest first) run `go get`, copy the sagernet replace directives of that
-#          lantern-box release into go.mod (a dependency's replace lines are ignored by Go, so a
-#          newer lantern-box would otherwise silently keep building against the OLD sing-box),
-#          and do a quick host compile check,
+#          lantern-box release into go.mod and do a quick host compile check,
 #        - the first one that compiles wins; if none does, the upstream pin is used.
 #     "upstream" (or empty) = exactly what radiance pins.  "v0.0.171" = force that one.
-#  2. The version that really got linked is read back from every finished binary and compared with
-#     what the ladder chose (the radiance#587 incident: go.mod said one version, the binary shipped
-#     another). A mismatch fails verification, so a wrong core is never published.
-#  3. If the SOCKS core does not compile with the chosen lantern-box on Android either, the first
-#     ABI falls back to the upstream pin and says so (LB fallback), instead of failing the job.
-#  4. The two patches that make a failing netlink network monitor non-fatal live in one idempotent
-#     script (patch-netmon.sh) that also runs again after a fallback, because a fallback can change
-#     the sing-box version that has to be patched.
-#  5. Build identity: BuildTime and Commit are injected when radiance declares them. The Version
-#     string is NOT injected any more unless you ask for it (inject_version): the config server may
-#     look at the client version, and an invented version string is not worth the risk.
+#  2. The lantern-box version really linked into every binary is read back and compared with what
+#     the ladder chose. A mismatch fails verification, so a wrong core is never published.
+#  3. If the SOCKS core does not compile with the chosen lantern-box on Android, the first ABI
+#     falls back to the upstream pin and says so (LB fallback).
+#  4. patch-netmon.sh makes a failing netlink network monitor non-fatal (idempotent, re-run after a
+#     fallback).
+#  5. Build identity: BuildTime and Commit are injected when radiance declares them. Version is only
+#     injected with inject_version.
 #  6. Soar zone / key injection and all the "facts" reports are unchanged.
+#  7. NEW: "Facts - DNS rules and rule-set ga-ir" prints where Lantern builds the DNS rules and the
+#     ga-ir rule-set (sing-box 1.14 rejects a DNS rule that mixes an IP-only rule-set with query_type /
+#     evaluate: "Legacy Address Filter Fields in DNS rules"). The result is uploaded as dns-facts.txt.
 
 on:
   workflow_dispatch:
@@ -122,11 +119,11 @@ jobs:
       - name: Prepare helper scripts
         run: |
           # ---- patch-netmon.sh ------------------------------------------------------------
-          # Run #11 proved the SOCKS branch is in the binary, yet connect died on Android with
-          # "create network monitor: netlink socket in Android is banned by Google". sing-box
-          # treats a failing network monitor as fatal only when route.auto_detect_interface is on.
-          # A SOCKS-only core has nothing to detect (the app excludes its own UID from the TUN),
-          # so the failure must be non-fatal. Two independent patches, both idempotent.
+          # Connect died on Android with "create network monitor: netlink socket in Android is
+          # banned by Google". sing-box treats a failing network monitor as fatal only when
+          # route.auto_detect_interface is on. A SOCKS-only core has nothing to detect (the app
+          # excludes its own UID from the TUN), so the failure must be non-fatal. Two independent
+          # patches, both idempotent.
           #
           # Side effect: with no interface monitor the daemon does not notice a Wi-Fi <-> mobile
           # switch by itself. The app compensates (LanternManager.onNetworkChanged).
@@ -405,6 +402,38 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # NEW. Read-only. Why the daemon logs
+      #   "fetch rule-set ga-ir : validate dns rule[3]: Legacy Address Filter Fields in DNS rules ..."
+      # sing-box 1.14 rejects a DNS rule that points to an IP-only rule-set (GeoIP style) while the
+      # DNS rules also use 1.14 fields (query_type / evaluate). This step prints where Lantern
+      # generates those rules and the ga-ir rule-set, so the next change can be an exact patch.
+      - name: Facts - DNS rules and rule-set ga-ir
+        if: always()
+        run: |
+          set +e
+          {
+            echo "## ga-ir / geoip-ir references (radiance)"
+            grep -rn -E 'ga-ir|geoip-ir|ga_ir' --include=*.go . | grep -v _test.go | head -40
+            LB="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/getlantern/lantern-box 2>/dev/null)"
+            echo; echo "## ga-ir / geoip-ir references (lantern-box: $LB)"
+            [ -d "$LB" ] && grep -rn -E 'ga-ir|geoip-ir|ga_ir' --include=*.go "$LB" | grep -v _test.go | head -40
+            echo; echo "## where DNS rules are built (radiance)"
+            grep -rn -E 'DNSRule|DefaultDNSRule|QueryType|MatchResponse|"evaluate"' --include=*.go vpn config 2>/dev/null | grep -v _test.go | head -60
+            echo; echo "## where DNS rules are built (lantern-box)"
+            [ -d "$LB" ] && grep -rn -E 'DNSRule|QueryType|MatchResponse|"evaluate"' --include=*.go "$LB" | grep -v _test.go | head -60
+            echo; echo "## rule_set definitions with a URL (who downloads rule-sets at start)"
+            grep -rn -E 'RuleSet|rule_set|ruleset' --include=*.go vpn config 2>/dev/null | grep -v _test.go | head -40
+            echo; echo "## sing-box dir and dns rule validation"
+            D="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/sagernet/sing-box 2>/dev/null)"
+            echo "$D"
+            grep -rn "Legacy Address Filter Fields" --include=*.go "$D" 2>/dev/null | head -10
+            echo; echo "## newest lantern-box tags"
+            go list -m -versions github.com/getlantern/lantern-box 2>/dev/null | tr ' ' '\n' | tail -8
+          } > dns-facts.txt 2>&1
+          echo "::group::dns-facts.txt"
+          cat dns-facts.txt
+          echo "::endgroup::"
+
       - name: Locate NDK
         run: |
           NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
@@ -566,7 +595,7 @@ jobs:
           echo "all $found core(s) OK: SOCKS-only build, lantern-box ${LB_EXPECT:-?}"
           {
             echo
-            echo "In the app log the new core shows up as: \`dep ... lantern-box ${LB_EXPECT:-?}\` and a new sha256. If the log still says v0.0.140 the old .so is still in the APK."
+            echo "In the app log the new core shows up as: \`dep ... lantern-box ${LB_EXPECT:-?}\` and a new sha256. If the log still shows an older version the old .so is still in the APK."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Opt-in only. The TUN build cannot run in the app (needs netlink), and shipping it
@@ -598,6 +627,7 @@ jobs:
           path: |
             source-facts.txt
             soar-facts.txt
+            dns-facts.txt
             patch-log.txt
             patch-log-fallback.txt
             core-info.txt
