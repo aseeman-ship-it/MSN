@@ -2,19 +2,32 @@ name: lantern-binaries
 
 # Builds the SOCKS-only Lantern core (liblantern_novpn.so) for the app.
 #
-# What changed compared with the previous version:
-#  1. lantern_box_version (optional): pin lantern-box. The core you shipped in October carried
-#     lantern-box v0.0.140. Later releases fix exactly the "stall, then the ladder picks the same
-#     bad server again" behaviour (v0.0.144 "switch off members that fail confirmation", v0.0.151,
-#     v0.0.170, v0.0.171 "reduce server flapping"), so rebuild with a newer one.
-#  2. Build identity: version / build time / commit are injected with -X, when this radiance
-#     checkout has those variables, so the daemon log says which build it is (it said version=dev).
-#  3. Soar: radiance replaced the old dnstt tunnel with Soar. A Soar client needs a zone and a
-#     server public key at build time. This workflow finds the variables by itself, injects YOUR
-#     zone / key when you provide them (secrets SOAR_ZONE / SOAR_PUBLIC_KEY, or the inputs) and
-#     writes soar-facts.txt so you can see what exists in this exact checkout. Without values the
-#     core is built exactly as before.
-#  4. Versions of the load-bearing modules are listed in the job summary and in soar-facts.txt.
+# What changed compared with the previous version (and why):
+#
+#  1. lantern-box is no longer left to chance.  The in-app log of 2026-11-22 still says
+#     "lantern-box v0.0.140 ... rev=992e315bbc time=2026-10-11 ... version=dev": the core that
+#     was running is the October build, none of the later auto-select fixes were in it.
+#     Now the default is  lantern_box_version = auto :
+#        - take the N newest lantern-box tags (lantern_box_candidates, default 4),
+#        - keep only the ones NEWER than what radiance pins,
+#        - for each (newest first) run `go get`, copy the sagernet replace directives of that
+#          lantern-box release into go.mod (a dependency's replace lines are ignored by Go, so a
+#          newer lantern-box would otherwise silently keep building against the OLD sing-box),
+#          and do a quick host compile check,
+#        - the first one that compiles wins; if none does, the upstream pin is used.
+#     "upstream" (or empty) = exactly what radiance pins.  "v0.0.171" = force that one.
+#  2. The version that really got linked is read back from every finished binary and compared with
+#     what the ladder chose (the radiance#587 incident: go.mod said one version, the binary shipped
+#     another). A mismatch fails verification, so a wrong core is never published.
+#  3. If the SOCKS core does not compile with the chosen lantern-box on Android either, the first
+#     ABI falls back to the upstream pin and says so (LB fallback), instead of failing the job.
+#  4. The two patches that make a failing netlink network monitor non-fatal live in one idempotent
+#     script (patch-netmon.sh) that also runs again after a fallback, because a fallback can change
+#     the sing-box version that has to be patched.
+#  5. Build identity: BuildTime and Commit are injected when radiance declares them. The Version
+#     string is NOT injected any more unless you ask for it (inject_version): the config server may
+#     look at the client version, and an invented version string is not worth the risk.
+#  6. Soar zone / key injection and all the "facts" reports are unchanged.
 
 on:
   workflow_dispatch:
@@ -23,8 +36,11 @@ on:
         description: "radiance branch/tag/commit (use a commit SHA once you have a build you trust)"
         default: "main"
       lantern_box_version:
-        description: "Optional: force a lantern-box version, e.g. v0.0.171. Empty = whatever radiance pins"
-        default: ""
+        description: "auto = newest lantern-box that compiles; upstream = what radiance pins; or a tag such as v0.0.171"
+        default: "auto"
+      lantern_box_candidates:
+        description: "auto mode: how many of the newest lantern-box tags to try (newest first)"
+        default: "4"
       package:
         description: "Go package"
         default: "./cmd/lanternd"
@@ -40,6 +56,10 @@ on:
       soar_public_key:
         description: "Optional Soar server public key. Prefer the SOAR_PUBLIC_KEY secret"
         default: ""
+      inject_version:
+        description: "Also inject common.Version (nana-<commit>). Off by default: the server may read the client version"
+        type: boolean
+        default: false
       build_armv7:
         description: "Also build armeabi-v7a (32-bit ARM). May fail, never blocks the job"
         type: boolean
@@ -62,10 +82,15 @@ env:
   TAGS: ${{ inputs.build_tags }}
   SOCKS_TAG: ${{ inputs.socks_tag }}
   PKG: ${{ inputs.package }}
+  LB_REQ: ${{ inputs.lantern_box_version }}
+  LB_TRY: ${{ inputs.lantern_box_candidates }}
+  # go get / go mod edit change go.mod and go.sum; builds must be allowed to follow them.
+  GOFLAGS: -mod=mod
 
 jobs:
   binary:
     runs-on: ubuntu-24.04
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,19 +108,241 @@ jobs:
           git config --global url."https://${GH_PAT}@github.com/".insteadOf "https://github.com/"
           echo "GOPRIVATE=github.com/getlantern/*" >> $GITHUB_ENV
 
-      - name: Pin lantern-box (optional)
-        if: ${{ inputs.lantern_box_version != '' }}
-        env:
-          LB_VER: ${{ inputs.lantern_box_version }}
-        run: |
-          set -o pipefail
-          go get "github.com/getlantern/lantern-box@${LB_VER}" 2>&1 | tee lb-pin.log
-          echo "lantern-box pinned to ${LB_VER}" | tee -a "$GITHUB_STEP_SUMMARY"
-
-      - name: Download modules
+      - name: Download modules (upstream state)
         run: |
           set -o pipefail
           go mod download 2>&1 | tee deps.log
+          cp go.mod go.mod.upstream
+          cp go.sum go.sum.upstream
+
+      # ------------------------------------------------------------------------------------
+      # Helper scripts. Created first so every later step (and the fallback inside the build)
+      # uses the very same code.
+      # ------------------------------------------------------------------------------------
+      - name: Prepare helper scripts
+        run: |
+          # ---- patch-netmon.sh ------------------------------------------------------------
+          # Run #11 proved the SOCKS branch is in the binary, yet connect died on Android with
+          # "create network monitor: netlink socket in Android is banned by Google". sing-box
+          # treats a failing network monitor as fatal only when route.auto_detect_interface is on.
+          # A SOCKS-only core has nothing to detect (the app excludes its own UID from the TUN),
+          # so the failure must be non-fatal. Two independent patches, both idempotent.
+          #
+          # Side effect: with no interface monitor the daemon does not notice a Wi-Fi <-> mobile
+          # switch by itself. The app compensates (LanternManager.onNetworkChanged).
+          cat > patch-netmon.sh <<'EOF'
+          #!/usr/bin/env bash
+          set +e
+          echo "## radiance: AutoDetectInterface before"
+          grep -rn -i "AutoDetectInterface\|auto_detect_interface" --include=*.go . | grep -v _test.go
+          echo "## 1) radiance: never request auto-detect"
+          grep -rl -i "AutoDetectInterface\|auto_detect_interface" --include=*.go vpn backend config 2>/dev/null | grep -v _test.go | while read -r f; do
+            perl -pi -e 's/(AutoDetectInterface\s*[:=]+\s*)true/${1}false/g; s/("auto_detect_interface"\s*:\s*)true/${1}false/g' "$f"
+            echo "patched $f"
+          done
+          echo "## radiance: after"
+          grep -rn -i "AutoDetectInterface\|auto_detect_interface" --include=*.go . | grep -v _test.go
+          echo "## 2) sing-box: make a failing network monitor non-fatal"
+          D="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/sagernet/sing-box)"
+          F="$D/route/network.go"
+          echo "sing-box dir: $D"
+          if [ -f "$F" ]; then
+            chmod -R u+w "$D" 2>/dev/null
+            echo "-- code around the error, before:"
+            grep -n -B6 -A8 'create network monitor' "$F" | head -60
+            if grep -q 'enforceInterfaceMonitor := options.AutoDetectInterface' "$F"; then
+              sed -i 's/enforceInterfaceMonitor := options.AutoDetectInterface/enforceInterfaceMonitor := false/' "$F"
+              echo "PATCHED sing-box: enforceInterfaceMonitor := false"
+            elif grep -q 'enforceInterfaceMonitor := false' "$F"; then
+              echo "sing-box already patched"
+            else
+              echo "::warning::route/network.go has no 'enforceInterfaceMonitor := options.AutoDetectInterface' line. Send patch-log.txt"
+            fi
+          else
+            echo "::warning::$F not found"
+          fi
+          EOF
+          chmod +x patch-netmon.sh
+
+          # ---- ci-build-core.sh -----------------------------------------------------------
+          #   ./ci-build-core.sh <abi>      abi = arm64-v8a | armeabi-v7a | x86_64 | x86
+          # Attempts: the full tag set (or the one that worked for the first ABI), then a slimmer
+          # one (without with_wireguard and standalone). If the pinned lantern-box was the problem
+          # (LB_PINNED=1) a last attempt restores the upstream go.mod/go.sum and tries again; that
+          # decision is global (written to GITHUB_ENV), so every ABI is built from the same modules.
+          # No -v: it prints every package name and buries the one error line.
+          cat > ci-build-core.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -uo pipefail
+          ABI="$1"
+          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          PAGE=""
+          case "$ABI" in
+            arm64-v8a)   GOARCH_=arm64; GOARM_="";  CLANG="aarch64-linux-android24-clang";     PAGE="-Wl,-z,max-page-size=16384" ;;
+            armeabi-v7a) GOARCH_=arm;   GOARM_="7"; CLANG="armv7a-linux-androideabi24-clang"   ;;
+            x86_64)      GOARCH_=amd64; GOARM_="";  CLANG="x86_64-linux-android24-clang";      PAGE="-Wl,-z,max-page-size=16384" ;;
+            x86)         GOARCH_=386;   GOARM_="";  CLANG="i686-linux-android24-clang"         ;;
+            *) echo "::error::unknown ABI $ABI"; exit 2 ;;
+          esac
+          CC_BIN="$TC/$CLANG"
+          CXX_BIN="$TC/${CLANG}++"
+          if [ ! -x "$CXX_BIN" ]; then echo "::error::NDK has no $CLANG++"; exit 1; fi
+          OUT="out/$ABI/liblantern_novpn.so"
+          mkdir -p "out/$ABI"
+
+          build_core() {  # $1 tags, $2 log file
+            CGO_ENABLED=1 GOOS=android GOARCH="$GOARCH_" GOARM="$GOARM_" CC="$CC_BIN" CXX="$CXX_BIN" \
+            go build -trimpath -buildmode=pie -tags "$1" \
+              -ldflags "-s -w -checklinkname=0 ${XFLAGS:-} -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ $PAGE'" \
+              -o "$OUT" "$PKG" > "$2" 2>&1
+          }
+
+          FULL="$TAGS,$SOCKS_TAG"
+          SLIM="$(echo "$TAGS" | tr ',' '\n' | grep -v -x -e with_wireguard -e standalone | paste -sd, - || true),$SOCKS_TAG"
+          FIRST="${USED_TAGS:-$FULL}"
+
+          ok=0
+          try_set() {  # $1 name, $2 tags
+            local name="$1" tags="$2"
+            echo "::group::$ABI attempt $name  tags=$tags"
+            if build_core "$tags" "build-$ABI-$name.log"; then
+              echo "built OK"
+              echo "$tags" > "out/$ABI/.used_tags"
+              if [ -z "${USED_TAGS:-}" ]; then echo "USED_TAGS=$tags" >> "$GITHUB_ENV"; fi
+              echo "::endgroup::"
+              return 0
+            fi
+            echo "FAILED, last 50 lines:"
+            tail -50 "build-$ABI-$name.log"
+            echo "::endgroup::"
+            return 1
+          }
+
+          try_set first "$FIRST" && ok=1
+          if [ "$ok" != 1 ] && [ "$SLIM" != "$FIRST" ]; then try_set slim "$SLIM" && ok=1; fi
+
+          if [ "$ok" != 1 ] && [ "${LB_PINNED:-0}" = 1 ]; then
+            echo "::warning::$ABI did not compile with the pinned lantern-box ${LB_EXPECT:-?}: falling back to the upstream pin for ALL ABIs"
+            cp go.mod.upstream go.mod
+            cp go.sum.upstream go.sum
+            go mod download 2>&1 | tail -5
+            ./patch-netmon.sh > patch-log-fallback.txt 2>&1 || true
+            NEW_LB="$(go list -m -f '{{.Version}}' github.com/getlantern/lantern-box)"
+            echo "LB_EXPECT=$NEW_LB" >> "$GITHUB_ENV"
+            echo "LB_PINNED=0" >> "$GITHUB_ENV"
+            echo "LB_FALLBACK=1" >> "$GITHUB_ENV"
+            echo "lantern-box FALLBACK to upstream $NEW_LB (the pinned one did not compile on Android)" | tee -a "$GITHUB_STEP_SUMMARY"
+            try_set upstream-lb "$FIRST" && ok=1
+            if [ "$ok" != 1 ] && [ "$SLIM" != "$FIRST" ]; then try_set upstream-lb-slim "$SLIM" && ok=1; fi
+          fi
+
+          if [ "$ok" != 1 ]; then
+            rm -f "$OUT"
+            echo "::error::$ABI SOCKS core did not compile. See build-$ABI-*.log (artifact lantern-report-and-logs)."
+            exit 1
+          fi
+          file "$OUT"
+          ls -lh "$OUT"
+          EOF
+          chmod +x ci-build-core.sh
+
+      # ------------------------------------------------------------------------------------
+      # lantern-box pin ladder.
+      # ------------------------------------------------------------------------------------
+      - name: Choose lantern-box (pin ladder)
+        run: |
+          set +e
+          LBM=github.com/getlantern/lantern-box
+          UP_LB="$(go list -m -f '{{.Version}}' $LBM 2>/dev/null)"
+          echo "radiance pins lantern-box: ${UP_LB:-unknown}"
+          : > lb-pin.log
+
+          # Copies the replace lines for sagernet modules from the chosen lantern-box go.mod into
+          # ours when theirs is newer. Go ignores replace directives of dependencies, so without this
+          # a newer lantern-box keeps compiling against radiance's older sing-box fork.
+          align_replaces() {
+            local LBDIR; LBDIR="$(go list -m -f '{{.Dir}}' $LBM 2>/dev/null)"
+            [ -f "$LBDIR/go.mod" ] || { echo "no go.mod for lantern-box in the module cache"; return 0; }
+            go mod edit -json "$LBDIR/go.mod" | jq -r '.Replace[]? | select(.Old.Path | test("^github.com/sagernet/")) | select(.New.Version != null and .New.Version != "") | "\(.Old.Path)|\(.New.Path)|\(.New.Version)"' | while IFS='|' read -r old newp newv; do
+              cur="$(go mod edit -json go.mod | jq -r --arg o "$old" '.Replace[]? | select(.Old.Path==$o) | .New.Version' | head -1)"
+              if [ -z "$cur" ]; then
+                go mod edit -replace "$old=$newp@$newv"; echo "replace added:   $old => $newp@$newv"
+              elif [ "$cur" != "$newv" ] && [ "$(printf '%s\n%s\n' "$cur" "$newv" | sort -V | tail -1)" = "$newv" ]; then
+                go mod edit -replace "$old=$newp@$newv"; echo "replace updated: $old => $newp@$newv (was $cur)"
+              else
+                echo "replace kept:    $old (ours $cur, lantern-box $newv)"
+              fi
+            done
+          }
+
+          # Host compile check (fast, no NDK). It only tells "does radiance still build against this
+          # lantern-box"; the real Android build happens later.
+          compile_check() {
+            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "$TAGS,$SOCKS_TAG" -o /dev/null "$PKG" > "$1" 2>&1
+          }
+
+          CANDS=""
+          EXPLICIT=0
+          case "$LB_REQ" in
+            ""|upstream) CANDS="" ;;
+            auto)
+              CANDS="$(go list -m -versions $LBM 2>/dev/null | tr ' ' '\n' | tail -n +2 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n "${LB_TRY:-4}" | sort -rV)"
+              ;;
+            *) CANDS="$LB_REQ"; EXPLICIT=1 ;;
+          esac
+          echo "candidates (newest first): $(echo $CANDS)"
+
+          BASE_OK=0
+          if [ -n "$CANDS" ]; then
+            if compile_check check-upstream.log; then BASE_OK=1; echo "host compile check works on the upstream state"; else
+              echo "::warning::host compile check fails even on the upstream state; candidates will be accepted without it (the Android build decides)"
+              tail -15 check-upstream.log
+            fi
+          fi
+
+          CHOSEN=""
+          for v in $CANDS; do
+            if [ "$EXPLICIT" = 0 ]; then
+              [ "$v" = "$UP_LB" ] && continue
+              if [ -n "$UP_LB" ] && [ "$(printf '%s\n%s\n' "$UP_LB" "$v" | sort -V | tail -1)" != "$v" ]; then
+                echo "skip $v (not newer than $UP_LB)"; continue
+              fi
+            fi
+            echo "::group::try lantern-box $v"
+            cp go.mod.upstream go.mod; cp go.sum.upstream go.sum
+            if ! go get "$LBM@$v" >> lb-pin.log 2>&1; then
+              echo "go get failed:"; tail -20 lb-pin.log; echo "::endgroup::"; continue
+            fi
+            align_replaces
+            go mod download >> lb-pin.log 2>&1
+            if [ "$BASE_OK" = 1 ]; then
+              if compile_check "check-$v.log"; then CHOSEN="$v"; echo "compiles"; else echo "does NOT compile with radiance:"; tail -25 "check-$v.log"; fi
+            else
+              CHOSEN="$v"
+            fi
+            echo "::endgroup::"
+            [ -n "$CHOSEN" ] && break
+          done
+
+          if [ -z "$CHOSEN" ]; then
+            cp go.mod.upstream go.mod; cp go.sum.upstream go.sum
+            go mod download >> lb-pin.log 2>&1
+            [ -n "$CANDS" ] && echo "::warning::no newer lantern-box compiled with this radiance checkout; using the upstream pin ${UP_LB:-?}"
+          fi
+
+          EXPECT="$(go list -m -f '{{.Version}}' $LBM 2>/dev/null)"
+          echo "LB_EXPECT=$EXPECT" >> "$GITHUB_ENV"
+          echo "LB_PINNED=$([ -n "$CHOSEN" ] && echo 1 || echo 0)" >> "$GITHUB_ENV"
+          echo "LB_FALLBACK=0" >> "$GITHUB_ENV"
+          {
+            echo "### lantern-box"
+            echo "- requested: \`${LB_REQ:-upstream}\`"
+            echo "- radiance pins: \`${UP_LB:-?}\`"
+            echo "- **using: \`$EXPECT\`**"
+          } >> "$GITHUB_STEP_SUMMARY"
+          diff -u go.mod.upstream go.mod > go-mod.diff 2>&1
+          echo "---- go.mod changes vs upstream:"
+          cat go-mod.diff
 
       # Read-only facts about this exact radiance checkout: which files the SOCKS tag
       # gates, and what the SOCKS backend does. Uploaded as source-facts.txt.
@@ -116,6 +363,9 @@ jobs:
             echo; echo "## who reads RADIANCE_SOCKS_ADDRESS / device id"
             grep -rn "RADIANCE_SOCKS_ADDRESS\|RADIANCE_USE_SOCKS_PROXY\|RADIANCE_DEVICE_ID" --include=*.go . | head -20
             grep -rn "DeviceIDKey" --include=*.go common/settings | head -10
+            echo; echo "## IPC routes (the app pins a server with POST /vpn/connect {\"tag\": ...})"
+            grep -rn -E '"(GET|POST|PUT|DELETE) ?/?[a-z]*/[a-z_/-]+"|HandleFunc|Handle\(' --include=*.go ipc 2>/dev/null | grep -v _test.go | head -60
+            grep -rn -E 'ConnectRequest|SelectServer|selected_server|SelectedServer' --include=*.go . 2>/dev/null | grep -v _test.go | head -30
           } > source-facts.txt 2>&1 || true
           echo "::group::source-facts.txt"
           cat source-facts.txt
@@ -163,7 +413,8 @@ jobs:
           test -x "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++"
 
       # Builds XFLAGS (extra -X linker flags):
-      #  - build identity (Version / BuildTime / Commit) when common/ declares those variables
+      #  - build identity (BuildTime / Commit, and Version only with inject_version) when common/
+      #    declares those variables
       #  - Soar zone + public key, only when YOU provided both AND the variables were found
       # Values are masked in the log and never printed. Nothing is invented: a variable that is
       # not found is simply skipped and reported.
@@ -171,6 +422,7 @@ jobs:
         env:
           SOAR_ZONE: ${{ secrets.SOAR_ZONE || inputs.soar_zone }}
           SOAR_PUBKEY: ${{ secrets.SOAR_PUBLIC_KEY || inputs.soar_public_key }}
+          INJECT_VERSION: ${{ inputs.inject_version }}
         run: |
           set +e
           [ -n "$SOAR_ZONE" ] && echo "::add-mask::$SOAR_ZONE"
@@ -183,7 +435,9 @@ jobs:
           has_var() {  # $1 = file glob, $2 = variable name
             grep -hE "^[[:space:]]*(var[[:space:]]+)?$2[[:space:]]+(string[[:space:]]*)?=" $1 >/dev/null 2>&1
           }
-          for spec in "Version=nana-${SHORT}" "BuildTime=${NOW}" "Commit=${SHORT}"; do
+          SPECS="BuildTime=${NOW} Commit=${SHORT}"
+          if [ "$INJECT_VERSION" = "true" ]; then SPECS="Version=nana-${SHORT} $SPECS"; fi
+          for spec in $SPECS; do
             n="${spec%%=*}"; v="${spec#*=}"
             if has_var "common/*.go" "$n"; then
               XF="$XF -X $MOD/common.$n=$v"
@@ -233,113 +487,8 @@ jobs:
           echo "XFLAGS=$XF" >> "$GITHUB_ENV"
           echo "SOAR_INJECTED=$SOAR_INJECTED" >> "$GITHUB_ENV"
 
-      # Run #11 proved the SOCKS branch is in the binary, yet connect still died on Android with
-      # "create network monitor: netlink socket in Android is banned by Google". sing-box treats
-      # a failing network monitor as fatal only when route.auto_detect_interface is on. A SOCKS-only
-      # core has nothing to detect (the app excludes its own UID from the TUN), so the monitor
-      # failure must be non-fatal. Two independent patches; each one prints what it did.
-      #
-      # Side effect to remember: with no interface monitor the daemon does not notice a Wi-Fi <->
-      # mobile switch by itself. The app compensates (LanternManager.onNetworkChanged: probe, then
-      # re-issue connect, then relaunch the daemon).
       - name: Patch - no fatal netlink network monitor
-        run: |
-          set +e
-          {
-            echo "## radiance: AutoDetectInterface before"
-            grep -rn -i "AutoDetectInterface\|auto_detect_interface" --include=*.go . | grep -v _test.go | tee patch-before.txt
-            echo "## 1) radiance: never request auto-detect"
-            grep -rl -i "AutoDetectInterface\|auto_detect_interface" --include=*.go vpn backend config 2>/dev/null | grep -v _test.go | while read -r f; do
-              perl -pi -e 's/(AutoDetectInterface\s*[:=]+\s*)true/${1}false/g; s/("auto_detect_interface"\s*:\s*)true/${1}false/g' "$f"
-              echo "patched $f"
-            done
-            echo "## radiance: after"
-            grep -rn -i "AutoDetectInterface\|auto_detect_interface" --include=*.go . | grep -v _test.go
-            echo "## 2) sing-box: make a failing network monitor non-fatal"
-            D="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/sagernet/sing-box)"
-            F="$D/route/network.go"
-            echo "sing-box dir: $D"
-            if [ -f "$F" ]; then
-              chmod -R u+w "$D" 2>/dev/null
-              echo "-- code around the error, before:"
-              grep -n -B6 -A8 'create network monitor' "$F" | head -60
-              if grep -q 'enforceInterfaceMonitor := options.AutoDetectInterface' "$F"; then
-                sed -i 's/enforceInterfaceMonitor := options.AutoDetectInterface/enforceInterfaceMonitor := false/' "$F"
-                echo "PATCHED sing-box: enforceInterfaceMonitor := false"
-              else
-                echo "::warning::route/network.go has no 'enforceInterfaceMonitor := options.AutoDetectInterface' line. Send patch-log.txt"
-              fi
-            else
-              echo "::warning::$F not found"
-            fi
-          } 2>&1 | tee patch-log.txt
-
-      # One shared build script for every ABI, so all of them are built the same way:
-      #   ./ci-build-core.sh <abi>      abi = arm64-v8a | armeabi-v7a | x86_64 | x86
-      # Two attempts: the full tag set first, then a slimmer one (without with_wireguard and
-      # standalone) in case the SOCKS branch does not compile with them. The tag set that
-      # worked for the first ABI (arm64-v8a) is recorded in USED_TAGS and tried first for the
-      # next ABIs. No -v: it prints every package name and buries the one error line.
-      # XFLAGS (build identity, Soar) comes from the "Discover ldflags" step.
-      - name: Prepare build helper
-        run: |
-          cat > ci-build-core.sh <<'EOF'
-          #!/usr/bin/env bash
-          set -uo pipefail
-          ABI="$1"
-          TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          PAGE=""
-          case "$ABI" in
-            arm64-v8a)   GOARCH_=arm64; GOARM_="";  CLANG="aarch64-linux-android24-clang";     PAGE="-Wl,-z,max-page-size=16384" ;;
-            armeabi-v7a) GOARCH_=arm;   GOARM_="7"; CLANG="armv7a-linux-androideabi24-clang"   ;;
-            x86_64)      GOARCH_=amd64; GOARM_="";  CLANG="x86_64-linux-android24-clang";      PAGE="-Wl,-z,max-page-size=16384" ;;
-            x86)         GOARCH_=386;   GOARM_="";  CLANG="i686-linux-android24-clang"         ;;
-            *) echo "::error::unknown ABI $ABI"; exit 2 ;;
-          esac
-          CC_BIN="$TC/$CLANG"
-          CXX_BIN="$TC/${CLANG}++"
-          if [ ! -x "$CXX_BIN" ]; then echo "::error::NDK has no $CLANG++"; exit 1; fi
-          OUT="out/$ABI/liblantern_novpn.so"
-          mkdir -p "out/$ABI"
-
-          build_core() {  # $1 tags, $2 log file
-            CGO_ENABLED=1 GOOS=android GOARCH="$GOARCH_" GOARM="$GOARM_" CC="$CC_BIN" CXX="$CXX_BIN" \
-            go build -trimpath -buildmode=pie -tags "$1" \
-              -ldflags "-s -w -checklinkname=0 ${XFLAGS:-} -linkmode=external -extld=$CXX_BIN -extldflags '-static-libstdc++ $PAGE'" \
-              -o "$OUT" "$PKG" > "$2" 2>&1
-          }
-
-          FULL="$TAGS,$SOCKS_TAG"
-          SLIM="$(echo "$TAGS" | tr ',' '\n' | grep -v -x -e with_wireguard -e standalone | paste -sd, - || true),$SOCKS_TAG"
-          FIRST="${USED_TAGS:-$FULL}"
-
-          ok=0
-          for attempt in "first|$FIRST" "slim|$SLIM"; do
-            name="${attempt%%|*}"; tags="${attempt#*|}"
-            # do not retry the same tag set twice
-            if [ "$name" = slim ] && [ "$tags" = "$FIRST" ]; then continue; fi
-            echo "::group::$ABI attempt $name  tags=$tags"
-            if build_core "$tags" "build-$ABI-$name.log"; then
-              echo "built OK"
-              echo "$tags" > "out/$ABI/.used_tags"
-              if [ -z "${USED_TAGS:-}" ]; then echo "USED_TAGS=$tags" >> "$GITHUB_ENV"; fi
-              echo "::endgroup::"
-              ok=1
-              break
-            fi
-            echo "FAILED, last 50 lines:"
-            tail -50 "build-$ABI-$name.log"
-            echo "::endgroup::"
-          done
-          if [ "$ok" != 1 ]; then
-            rm -f "$OUT"
-            echo "::error::$ABI SOCKS core did not compile. See build-$ABI-*.log (artifact lantern-report-and-logs)."
-            exit 1
-          fi
-          file "$OUT"
-          ls -lh "$OUT"
-          EOF
-          chmod +x ci-build-core.sh
+        run: ./patch-netmon.sh 2>&1 | tee patch-log.txt
 
       - name: Build arm64-v8a SOCKS core -> liblantern_novpn.so (required)
         run: ./ci-build-core.sh arm64-v8a
@@ -362,6 +511,7 @@ jobs:
       # Proof from each finished binary, not from the command line:
       #  - the Go build info must list the SOCKS tag
       #  - the TUN option builder (boxoptions_default.go) must not be linked in
+      #  - the lantern-box version linked into the binary must be the one that was chosen
       #  - when Soar values were linked, the zone must be present in the binary (warning only)
       # core-info.txt carries the sha256: the app prints the first 16 hex digits in its log.
       # Every binary that exists is checked; one bad binary fails the whole step, so a
@@ -375,8 +525,8 @@ jobs:
           : > core-info.txt
           {
             echo "### Core check"
-            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` in build info | TUN builder linked (must be 0) | SOCKS builder linked | Soar zone linked | sha256 (first 16) |"
-            echo "|---|---|---|---|---|---|"
+            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` | TUN builder linked (must be 0) | SOCKS builder linked | lantern-box in binary | expected | Soar zone | sha256 (first 16) |"
+            echo "|---|---|---|---|---|---|---|---|"
           } | tee -a "$GITHUB_STEP_SUMMARY"
           bad=0
           found=0
@@ -394,13 +544,18 @@ jobs:
             if go version -m "$f" | grep -E 'build[[:space:]]+-tags=' | sed 's/.*-tags=//' | tr ',' '\n' | grep -qx "$SOCKS_TAG"; then has_tag=1; fi
             tun_refs="$(strings -a "$f" | grep -c 'boxoptions_default.go' || true)"
             socks_refs="$(strings -a "$f" | grep -c 'boxoptions_novpn.go' || true)"
+            lb_in="$(go version -m "$f" | awk '$1=="dep" && $2=="github.com/getlantern/lantern-box" {print $3}' | head -1)"
             soar_state="n/a"
             if [ "${SOAR_INJECTED:-0}" = 1 ] && [ -n "$SOAR_ZONE" ]; then
               if strings -a "$f" | grep -qF -- "$SOAR_ZONE"; then soar_state="yes"; else soar_state="NOT FOUND"; echo "::warning::$abi: the Soar zone was passed to the linker but is not visible in the binary (the variable may be unused or stored differently)"; fi
             fi
-            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | $soar_state | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | ${lb_in:-?} | ${LB_EXPECT:-?} | $soar_state | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
             if [ "$has_tag" != 1 ] || [ "$tun_refs" != 0 ]; then
               echo "::error::$abi liblantern_novpn.so is NOT a SOCKS-only build (tag present: $has_tag, TUN code references: $tun_refs)"
+              bad=1
+            fi
+            if [ -n "${LB_EXPECT:-}" ] && [ "$lb_in" != "$LB_EXPECT" ]; then
+              echo "::error::$abi: lantern-box in the binary is '${lb_in:-?}' but the build was meant to use '$LB_EXPECT'"
               bad=1
             fi
           done
@@ -408,7 +563,11 @@ jobs:
           if [ "$found" = 0 ]; then echo "::error::no core was built"; exit 1; fi
           if [ ! -f out/arm64-v8a/liblantern_novpn.so ]; then echo "::error::the required arm64-v8a core is missing"; exit 1; fi
           if [ "$bad" != 0 ]; then exit 1; fi
-          echo "all $found core(s) OK: SOCKS-only build"
+          echo "all $found core(s) OK: SOCKS-only build, lantern-box ${LB_EXPECT:-?}"
+          {
+            echo
+            echo "In the app log the new core shows up as: \`dep ... lantern-box ${LB_EXPECT:-?}\` and a new sha256. If the log still says v0.0.140 the old .so is still in the APK."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Opt-in only. The TUN build cannot run in the app (needs netlink), and shipping it
       # next to the SOCKS one invites a silent fallback to the wrong core.
@@ -440,10 +599,12 @@ jobs:
             source-facts.txt
             soar-facts.txt
             patch-log.txt
-            patch-before.txt
+            patch-log-fallback.txt
             core-info.txt
+            go-mod.diff
             deps.log
             lb-pin.log
+            check-*.log
             build-*.log
           if-no-files-found: ignore
 
