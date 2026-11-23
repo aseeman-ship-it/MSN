@@ -237,14 +237,25 @@ jobs:
           }
           GOEOF
           sed -i "s|__DROP__|$DROP|" "$D/dns/zz_dnsfix.go"
+          echo "-- where the DNS rules enter the router:"
+          grep -n -E 'func \(r \*Router\) (Initialize|Start|buildRules)|options\.Rules|rawRules' "$F" | head -20
+          # Hook 1: NewRouter(options) - kept, harmless when options.Rules is not what the router uses.
           perl -0pi -e 's/(func NewRouter\([^{]*\{\n)/$1\toptions.Rules = dnsfixDropRules(options.Rules)\n/' "$F"
-          if ! grep -q 'options.Rules = dnsfixDropRules' "$F"; then
-            echo "::warning::could not find 'func NewRouter(...) {' in dns/router.go; DNS patch reverted"
+          # Hook 2: Initialize(rules []option.DNSRule) - in sing-box 1.12+ this is where box.go hands over
+          # the DNS rules (and the router keeps them as rawRules for the later rule-set re-validation).
+          perl -0pi -e 's/(func \(\w+ \*Router\) Initialize\((\w+) \[\]option\.DNSRule\)[^{]*\{\n)/$1\t$2 = dnsfixDropRules($2)\n/' "$F"
+          HOOKS="$(grep -c 'dnsfixDropRules' "$F")"
+          echo "hooks inserted: $HOOKS"
+          if [ "$HOOKS" = 0 ]; then
+            echo "::warning::found neither NewRouter(...) nor Initialize(rules []option.DNSRule) in dns/router.go; DNS patch reverted. Send patch-dns-log.txt"
             cp "$F.dnsfix.bak" "$F"; rm -f "$D/dns/zz_dnsfix.go"; exit 0
+          fi
+          if ! grep -q -E '^\s+\w+ = dnsfixDropRules\(\w+\)$' "$F"; then
+            echo "::warning::the Initialize hook was NOT inserted: the DNS patch may have no effect (NewRouter only). Send patch-dns-log.txt"
           fi
           if go build -tags "$TAGS,$SOCKS_TAG" github.com/sagernet/sing-box/dns > dnsfix-compile.log 2>&1; then
             echo "PATCHED sing-box dns router: DNS rules that use [$DROP] are dropped"
-            grep -n -A3 'func NewRouter' "$F" | head -8
+            grep -n -B1 -A2 'dnsfixDropRules' "$F" | head -20
           else
             echo "::warning::DNS patch did not compile; reverted. Send patch-dns-log.txt"
             tail -30 dnsfix-compile.log
