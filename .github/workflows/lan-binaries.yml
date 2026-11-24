@@ -54,8 +54,8 @@ on:
         description: "Optional Soar server public key. Prefer the SOAR_PUBLIC_KEY secret"
         default: ""
       dns_drop_rulesets:
-        description: "Comma separated rule-set tags whose DNS rules are dropped at sing-box level (sing-box 1.14 rejects them: 'Legacy Address Filter Fields'). Empty = no patch"
-        default: "ga-ir"
+        description: "Rule-set tags whose DNS rules are dropped at sing-box level (sing-box 1.14 rejects them: 'Legacy Address Filter Fields'). Comma separated; * = every DNS rule that uses a rule-set; empty = no patch"
+        default: "*"
       inject_version:
         description: "Also inject common.Version (nana-<commit>). Off by default: the server may read the client version"
         type: boolean
@@ -200,11 +200,16 @@ jobs:
             echo ''
             echo '// ---- dnsfix (added by the build, see patch-dnsrules.sh) ----'
             echo 'func dnsfixDropTag(tag string) bool {'
-            echo '	switch tag {'
-            echo "	case $CASES:"
-            echo '		return true'
-            echo '	}'
-            echo '	return false'
+            if echo "$DROP" | grep -q '\*'; then
+              # "*" = every DNS rule that points at a rule-set (tags in the config can change per country)
+              echo '	return tag != ""'
+            else
+              echo '	switch tag {'
+              echo "	case $CASES:"
+              echo '		return true'
+              echo '	}'
+              echo '	return false'
+            fi
             echo '}'
           } >> "$F"
           cat >> "$F" <<'GOEOF'
