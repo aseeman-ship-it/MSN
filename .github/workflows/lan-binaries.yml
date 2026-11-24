@@ -190,24 +190,24 @@ jobs:
           echo "-- NewRouter before:"
           grep -n -A3 'func NewRouter' "$F" | head -12
           cp "$F" "$F.dnsfix.bak"
-          cat > "$D/dns/zz_dnsfix.go" <<'GOEOF'
-          package dns
-
-          import (
-          	"strings"
-
-          	"github.com/sagernet/sing-box/option"
-          )
-
-          var dnsfixTags = func() map[string]bool {
-          	m := map[string]bool{}
-          	for _, t := range strings.Split("__DROP__", ",") {
-          		if t = strings.TrimSpace(t); t != "" {
-          			m[t] = true
-          		}
-          	}
-          	return m
-          }()
+          # The helper is APPENDED to the existing router.go. A NEW file in the module cache is not
+          # seen by go build (the module index of the cache is treated as immutable): the first
+          # attempt with a separate zz_dnsfix.go failed with "undefined: dnsfixDropRules". An edited
+          # existing file is read from disk, exactly like the netmon patch. No new imports are needed.
+          CASES="$(echo "$DROP" | tr ',' '\n' | sed 's/[[:space:]]//g; /^$/d; s/.*/"&"/' | paste -sd, -)"
+          if [ -z "$CASES" ]; then echo "no usable rule-set tag in [$DROP]: no DNS patch"; exit 0; fi
+          {
+            echo ''
+            echo '// ---- dnsfix (added by the build, see patch-dnsrules.sh) ----'
+            echo 'func dnsfixDropTag(tag string) bool {'
+            echo '	switch tag {'
+            echo "	case $CASES:"
+            echo '		return true'
+            echo '	}'
+            echo '	return false'
+            echo '}'
+          } >> "$F"
+          cat >> "$F" <<'GOEOF'
 
           func dnsfixMatch(r option.DNSRule) bool {
           	if r.Type == "logical" {
@@ -219,7 +219,7 @@ jobs:
           		return false
           	}
           	for _, tag := range r.DefaultOptions.RuleSet {
-          		if dnsfixTags[tag] {
+          		if dnsfixDropTag(tag) {
           			return true
           		}
           	}
@@ -236,7 +236,6 @@ jobs:
           	return out
           }
           GOEOF
-          sed -i "s|__DROP__|$DROP|" "$D/dns/zz_dnsfix.go"
           echo "-- where the DNS rules enter the router:"
           grep -n -E 'func \(r \*Router\) (Initialize|Start|buildRules)|options\.Rules|rawRules' "$F" | head -20
           # Hook 1: NewRouter(options) - kept, harmless when options.Rules is not what the router uses.
@@ -248,18 +247,18 @@ jobs:
           echo "hooks inserted: $HOOKS"
           if [ "$HOOKS" = 0 ]; then
             echo "::warning::found neither NewRouter(...) nor Initialize(rules []option.DNSRule) in dns/router.go; DNS patch reverted. Send patch-dns-log.txt"
-            cp "$F.dnsfix.bak" "$F"; rm -f "$D/dns/zz_dnsfix.go"; exit 0
+            cp "$F.dnsfix.bak" "$F"; exit 0
           fi
           if ! grep -q -E '^\s+\w+ = dnsfixDropRules\(\w+\)$' "$F"; then
             echo "::warning::the Initialize hook was NOT inserted: the DNS patch may have no effect (NewRouter only). Send patch-dns-log.txt"
           fi
-          if go build -tags "$TAGS,$SOCKS_TAG" github.com/sagernet/sing-box/dns > dnsfix-compile.log 2>&1; then
+          if GODEBUG=goindex=0 go build -tags "$TAGS,$SOCKS_TAG" github.com/sagernet/sing-box/dns > dnsfix-compile.log 2>&1; then
             echo "PATCHED sing-box dns router: DNS rules that use [$DROP] are dropped"
             grep -n -B1 -A2 'dnsfixDropRules' "$F" | head -20
           else
             echo "::warning::DNS patch did not compile; reverted. Send patch-dns-log.txt"
             tail -30 dnsfix-compile.log
-            cp "$F.dnsfix.bak" "$F"; rm -f "$D/dns/zz_dnsfix.go"
+            cp "$F.dnsfix.bak" "$F"
           fi
           EOF
           chmod +x patch-dnsrules.sh
