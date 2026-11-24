@@ -377,8 +377,11 @@ jobs:
 
           # Host compile check (fast, no NDK). It only tells "does radiance still build against this
           # lantern-box"; the real Android build happens later.
+          # Mirrors the real build: cgo on (like the Android build) and -checklinkname=0. The old
+          # CGO_ENABLED=0 check failed even on the untouched upstream state with
+          # "undefined: lookupCNAME", which made the ladder accept candidates blindly.
           compile_check() {
-            CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags "$TAGS,$SOCKS_TAG" -o /dev/null "$PKG" > "$1" 2>&1
+            CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags "-checklinkname=0" -tags "$TAGS,$SOCKS_TAG" -o /dev/null "$PKG" > "$1" 2>&1
           }
 
           CANDS=""
