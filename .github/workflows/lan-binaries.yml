@@ -303,26 +303,32 @@ jobs:
           #!/usr/bin/env bash
           set +e
           if [ "${QUIET_LOGS:-true}" != "true" ]; then echo "quiet_logs is off: no log patch"; exit 0; fi
-          PAT='"(inbound|outbound) connection (from|to) "'
-
           quiet_module() {   # $1 = module path
-            local mod="$1" D rel pkgs="" n=0
+            local mod="$1" D rel pkgs="" n=0 cand=0 LIST CAND
             D="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' "$mod" 2>/dev/null)"
             if [ ! -d "$D" ]; then echo "no source dir for $mod"; return 0; fi
             chmod -R u+w "$D" 2>/dev/null
-            : > "$D/.quiet-files"
-            while read -r f; do
-              [ -z "$f" ] && continue
-              if grep -qE "\.Info(Context)?\(.*$PAT" "$f"; then
-                cp "$f" "$f.quiet.bak"
-                perl -pi -e 'if (/"(?:inbound|outbound) connection (?:from|to) "/) { s/\.Info(Context)?\(/.Debug$1(/ }' "$f"
-                echo "$f" >> "$D/.quiet-files"
-                rel="${f#$D/}"
-                if [ "$(dirname "$rel")" = "." ]; then pkgs="$pkgs $mod"; else pkgs="$pkgs $mod/$(dirname "$rel")"; fi
-                echo "quieted: $mod/$rel ($(grep -cE "\.Debug(Context)?\(.*$PAT" "$f") line(s))"
-                n=$((n+1))
+            LIST="$PWD/quiet-files-$(basename "$D").txt"; CAND="$PWD/quiet-candidates-$(basename "$D").txt"
+            : > "$LIST"
+            # Fixed-string search (no regex): the first version of this script reported "0 file(s) changed"
+            # on the real module although 30+ matching lines exist (see dns-facts.txt). Counts are printed at
+            # every step now, so a zero is always explained.
+            grep -rlF --include='*.go' -e '"inbound connection ' -e '"outbound connection ' "$D" 2>/dev/null | grep -v '_test\.go$' > "$CAND"
+            cand="$(wc -l < "$CAND" | tr -d ' ')"
+            echo "$mod ($D): $cand candidate file(s) contain a per-connection log message"
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              cp "$f" "$f.quiet.bak" || { echo "cannot write next to ${f#$D/}"; continue; }
+              perl -pi -e 'if (/"(?:inbound|outbound) connection (?:from|to) "/) { s/\.Info(Context)?\(/.Debug$1(/ }' "$f"
+              if cmp -s "$f" "$f.quiet.bak"; then
+                rm -f "$f.quiet.bak"; echo "unchanged (no .Info call on that line): ${f#$D/}"; continue
               fi
-            done < <(grep -rlE "$PAT" --include=*.go "$D" 2>/dev/null | grep -v _test.go)
+              echo "$f" >> "$LIST"
+              rel="${f#$D/}"
+              if [ "$(dirname "$rel")" = "." ]; then pkgs="$pkgs $mod"; else pkgs="$pkgs $mod/$(dirname "$rel")"; fi
+              echo "quieted: $rel"
+              n=$((n+1))
+            done < "$CAND"
             echo "$mod: $n file(s) changed"
             [ "$n" = 0 ] && return 0
             # Only packages that really are part of this build (some protocols are behind tags that are off:
@@ -331,13 +337,13 @@ jobs:
             if [ -z "$BUILDABLE" ]; then
               echo "$mod: none of the touched packages is part of this build (tags): nothing to compile"
             elif GODEBUG=goindex=0 go build -tags "$TAGS,$SOCKS_TAG" $BUILDABLE > quiet-compile.log 2>&1; then
-              echo "$mod: compiles with the quiet patch"
+              echo "$mod: compiles with the quiet patch ($(echo $BUILDABLE | wc -w) package(s))"
             else
               echo "::warning::$mod: log patch did not compile; reverted. Send patch-quiet-log.txt"
               tail -25 quiet-compile.log
-              while read -r f; do [ -f "$f.quiet.bak" ] && cp "$f.quiet.bak" "$f"; done < "$D/.quiet-files"
+              while IFS= read -r f; do [ -f "$f.quiet.bak" ] && cp "$f.quiet.bak" "$f"; done < "$LIST"
             fi
-            while read -r f; do rm -f "$f.quiet.bak"; done < "$D/.quiet-files"
+            while IFS= read -r f; do rm -f "$f.quiet.bak"; done < "$LIST"
           }
 
           echo "## 1) per-connection log lines -> DEBUG"
