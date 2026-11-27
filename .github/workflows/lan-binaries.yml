@@ -22,9 +22,18 @@ name: lantern-binaries
 #  5. Build identity: BuildTime and Commit are injected when radiance declares them. Version is only
 #     injected with inject_version.
 #  6. Soar zone / key injection and all the "facts" reports are unchanged.
-#  7. NEW: "Facts - DNS rules and rule-set ga-ir" prints where Lantern builds the DNS rules and the
+#  7. "Facts - DNS rules and rule-set ga-ir" prints where Lantern builds the DNS rules and the
 #     ga-ir rule-set (sing-box 1.14 rejects a DNS rule that mixes an IP-only rule-set with query_type /
 #     evaluate: "Legacy Address Filter Fields in DNS rules"). The result is uploaded as dns-facts.txt.
+#  8. NEW: patch-logquiet.sh. The core logged every inbound / outbound connection at INFO (hundreds of
+#     lines per second right after connect: field log 2026-11-27) and every step of kindling's DNS race.
+#     Those lines are lowered to DEBUG at the source (sing-box, lantern-box, radiance kindling
+#     slogWriter). Each edit is compiled right away and reverted when it does not compile. Warnings,
+#     errors and the milestones the app reads (tcp select / tcp switch / user failure / config fetched)
+#     stay at INFO. Also re-run after the lantern-box fallback.
+#  9. NEW: verification also reports whether the DNS patch (dnsfixDropRules) is really linked into every
+#     binary, and dns-facts.txt now shows how Lantern picks its local DNS resolver (localDNSIP), which
+#     is what the "lookup ... exchange4: EOF" errors of Iranian (direct) domains come from.
 
 on:
   workflow_dispatch:
@@ -56,6 +65,10 @@ on:
       dns_drop_rulesets:
         description: "Rule-set tags whose DNS rules are dropped at sing-box level (sing-box 1.14 rejects them: 'Legacy Address Filter Fields'). Comma separated; * = every DNS rule that uses a rule-set; empty = no patch"
         default: "*"
+      quiet_logs:
+        description: "Lower per-connection / DNS-race INFO lines of the core to DEBUG (patch-logquiet.sh). Turn off only to debug the core itself"
+        type: boolean
+        default: true
       inject_version:
         description: "Also inject common.Version (nana-<commit>). Off by default: the server may read the client version"
         type: boolean
@@ -87,6 +100,7 @@ env:
   # go get / go mod edit change go.mod and go.sum; builds must be allowed to follow them.
   GOFLAGS: -mod=mod
   DNS_DROP: ${{ inputs.dns_drop_rulesets }}
+  QUIET_LOGS: ${{ inputs.quiet_logs }}
 
 jobs:
   binary:
@@ -268,6 +282,78 @@ jobs:
           EOF
           chmod +x patch-dnsrules.sh
 
+          # ---- patch-logquiet.sh ----------------------------------------------------------
+          # Field log 2026-11-27: right after connect the core printed hundreds of
+          #   "inbound connection from lo-..." / "inbound connection to ..." / "outbound connection to ..."
+          # INFO lines per second (sing-box logs every single connection at INFO), plus ~30 lines of
+          # kindling's DNS race ("run DNS" / "got DNS" / "running test") on every start. They fill the
+          # daemon log file, burn CPU in the pipe the app reads, and bury the few lines that matter.
+          # This lowers exactly those calls to DEBUG. It is string based (it finds the log call by its
+          # message), so it does not depend on file names that change between sing-box releases.
+          # Every touched package is compiled right away; on failure the edit is reverted.
+          # Kept at INFO on purpose: lantern-box "tcp select / tcp switch / user failure" (the app reads
+          # them), config fetch milestones, every WARN and ERROR.
+          cat > patch-logquiet.sh <<'EOF'
+          #!/usr/bin/env bash
+          set +e
+          if [ "${QUIET_LOGS:-true}" != "true" ]; then echo "quiet_logs is off: no log patch"; exit 0; fi
+          PAT='"(inbound|outbound) connection (from|to) "'
+
+          quiet_module() {   # $1 = module path
+            local mod="$1" D rel pkgs="" n=0
+            D="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' "$mod" 2>/dev/null)"
+            if [ ! -d "$D" ]; then echo "no source dir for $mod"; return 0; fi
+            chmod -R u+w "$D" 2>/dev/null
+            : > "$D/.quiet-files"
+            while read -r f; do
+              [ -z "$f" ] && continue
+              if grep -qE "\.Info(Context)?\(.*$PAT" "$f"; then
+                cp "$f" "$f.quiet.bak"
+                perl -pi -e 'if (/"(?:inbound|outbound) connection (?:from|to) "/) { s/\.Info(Context)?\(/.Debug$1(/ }' "$f"
+                echo "$f" >> "$D/.quiet-files"
+                rel="${f#$D/}"
+                if [ "$(dirname "$rel")" = "." ]; then pkgs="$pkgs $mod"; else pkgs="$pkgs $mod/$(dirname "$rel")"; fi
+                echo "quieted: $mod/$rel ($(grep -cE "\.Debug(Context)?\(.*$PAT" "$f") line(s))"
+                n=$((n+1))
+              fi
+            done < <(grep -rlE "$PAT" --include=*.go "$D" 2>/dev/null | grep -v _test.go)
+            echo "$mod: $n file(s) changed"
+            [ "$n" = 0 ] && return 0
+            if GODEBUG=goindex=0 go build -tags "$TAGS,$SOCKS_TAG" $(echo $pkgs | tr ' ' '\n' | sort -u) > quiet-compile.log 2>&1; then
+              echo "$mod: compiles with the quiet patch"
+            else
+              echo "::warning::$mod: log patch did not compile; reverted. Send patch-quiet-log.txt"
+              tail -25 quiet-compile.log
+              while read -r f; do [ -f "$f.quiet.bak" ] && cp "$f.quiet.bak" "$f"; done < "$D/.quiet-files"
+            fi
+            while read -r f; do rm -f "$f.quiet.bak"; done < "$D/.quiet-files"
+          }
+
+          echo "## 1) per-connection log lines -> DEBUG"
+          quiet_module github.com/sagernet/sing-box
+          quiet_module github.com/getlantern/lantern-box
+
+          echo "## 2) radiance kindling: slogWriter (DNS race chatter) INFO -> DEBUG"
+          for f in $(grep -rl 'slogWriter' --include=*.go kindling 2>/dev/null | grep -v _test.go | head -3); do
+            cp "$f" "$f.quiet.bak"
+            perl -0pi -e 's/(func \(\w+ \*?slogWriter\) Write\([^)]*\)[^{]*\{(?:(?!\nfunc ).)*?)\.Info(Context)?\(/$1.Debug$2(/s' "$f"
+            if cmp -s "$f" "$f.quiet.bak"; then
+              echo "slogWriter.Write in $f: no .Info( call inside it, unchanged"
+              rm -f "$f.quiet.bak"; continue
+            fi
+            if GODEBUG=goindex=0 go build -tags "$TAGS,$SOCKS_TAG" "./$(dirname "$f")" > quiet-kindling-compile.log 2>&1; then
+              echo "quieted slogWriter.Write in $f"
+              grep -n -A12 'slogWriter) Write' "$f" | head -20
+            else
+              echo "::warning::kindling log patch did not compile; reverted. Send patch-quiet-log.txt"
+              tail -25 quiet-kindling-compile.log
+              cp "$f.quiet.bak" "$f"
+            fi
+            rm -f "$f.quiet.bak"
+          done
+          EOF
+          chmod +x patch-logquiet.sh
+
           # ---- ci-build-core.sh -----------------------------------------------------------
           #   ./ci-build-core.sh <abi>      abi = arm64-v8a | armeabi-v7a | x86_64 | x86
           # Attempts: the full tag set (or the one that worked for the first ABI), then a slimmer
@@ -332,6 +418,7 @@ jobs:
             go mod download 2>&1 | tail -5
             ./patch-netmon.sh > patch-log-fallback.txt 2>&1 || true
             ./patch-dnsrules.sh > patch-dns-fallback.txt 2>&1 || true
+            ./patch-logquiet.sh > patch-quiet-fallback.txt 2>&1 || true
             NEW_LB="$(go list -m -f '{{.Version}}' github.com/getlantern/lantern-box)"
             echo "LB_EXPECT=$NEW_LB" >> "$GITHUB_ENV"
             echo "LB_PINNED=0" >> "$GITHUB_ENV"
@@ -513,11 +600,14 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # NEW. Read-only. Why the daemon logs
+      # Read-only. Why the daemon logs
       #   "fetch rule-set ga-ir : validate dns rule[3]: Legacy Address Filter Fields in DNS rules ..."
       # sing-box 1.14 rejects a DNS rule that points to an IP-only rule-set (GeoIP style) while the
       # DNS rules also use 1.14 fields (query_type / evaluate). This step prints where Lantern
       # generates those rules and the ga-ir rule-set, so the next change can be an exact patch.
+      # NEW: also where the local DNS resolver is chosen (the log says "Using Quad9 for locale"; Iranian
+      # domains that route direct then fail with "lookup ...: exchange4: EOF") and where sing-box logs
+      # the per-connection lines that patch-logquiet.sh lowers.
       - name: Facts - DNS rules and rule-set ga-ir
         if: always()
         run: |
@@ -534,10 +624,16 @@ jobs:
             [ -d "$LB" ] && grep -rn -E 'DNSRule|QueryType|MatchResponse|"evaluate"' --include=*.go "$LB" | grep -v _test.go | head -60
             echo; echo "## rule_set definitions with a URL (who downloads rule-sets at start)"
             grep -rn -E 'RuleSet|rule_set|ruleset' --include=*.go vpn config 2>/dev/null | grep -v _test.go | head -40
+            echo; echo "## localDNSIP: which resolver 'dns_local' uses per locale"
+            grep -rn -B2 -A40 'func localDNSIP' --include=*.go vpn 2>/dev/null | head -90
             echo; echo "## sing-box dir and dns rule validation"
             D="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/sagernet/sing-box 2>/dev/null)"
             echo "$D"
             grep -rn "Legacy Address Filter Fields" --include=*.go "$D" 2>/dev/null | head -10
+            echo; echo "## sing-box / lantern-box: per-connection INFO log calls (patch-logquiet.sh targets)"
+            grep -rn -E '"(inbound|outbound) connection (from|to) "' --include=*.go "$D" "$LB" 2>/dev/null | grep -v _test.go | head -30
+            echo; echo "## radiance kindling slogWriter"
+            grep -rn -A14 'slogWriter) Write' --include=*.go kindling 2>/dev/null | head -40
             echo; echo "## newest lantern-box tags"
             go list -m -versions github.com/getlantern/lantern-box 2>/dev/null | tr ' ' '\n' | tail -8
           } > dns-facts.txt 2>&1
@@ -633,6 +729,9 @@ jobs:
       - name: Patch - drop DNS rules that sing-box 1.14 rejects (ga-ir)
         run: ./patch-dnsrules.sh 2>&1 | tee patch-dns-log.txt
 
+      - name: Patch - quiet per-connection log lines (INFO to DEBUG)
+        run: ./patch-logquiet.sh 2>&1 | tee patch-quiet-log.txt
+
       - name: Build arm64-v8a SOCKS core -> liblantern_novpn.so (required)
         run: ./ci-build-core.sh arm64-v8a
 
@@ -656,6 +755,9 @@ jobs:
       #  - the TUN option builder (boxoptions_default.go) must not be linked in
       #  - the lantern-box version linked into the binary must be the one that was chosen
       #  - when Soar values were linked, the zone must be present in the binary (warning only)
+      #  - NEW: the DNS patch function must be linked in when the patch was requested (warning only:
+      #    the patch reverts itself when it does not compile, and the app then logs the
+      #    "Legacy Address Filter Fields" line)
       # core-info.txt carries the sha256: the app prints the first 16 hex digits in its log.
       # Every binary that exists is checked; one bad binary fails the whole step, so a
       # wrong core can never be published next to the good ones.
@@ -668,8 +770,8 @@ jobs:
           : > core-info.txt
           {
             echo "### Core check"
-            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` | TUN builder linked (must be 0) | SOCKS builder linked | lantern-box in binary | expected | Soar zone | sha256 (first 16) |"
-            echo "|---|---|---|---|---|---|---|---|"
+            echo "| ABI | SOCKS tag \`$SOCKS_TAG\` | TUN builder linked (must be 0) | SOCKS builder linked | lantern-box in binary | expected | DNS patch linked | Soar zone | sha256 (first 16) |"
+            echo "|---|---|---|---|---|---|---|---|---|"
           } | tee -a "$GITHUB_STEP_SUMMARY"
           bad=0
           found=0
@@ -688,11 +790,15 @@ jobs:
             tun_refs="$(strings -a "$f" | grep -c 'boxoptions_default.go' || true)"
             socks_refs="$(strings -a "$f" | grep -c 'boxoptions_novpn.go' || true)"
             lb_in="$(go version -m "$f" | awk '$1=="dep" && $2=="github.com/getlantern/lantern-box" {print $3}' | head -1)"
+            dns_state="off"
+            if [ -n "${DNS_DROP:-}" ]; then
+              if [ "$(strings -a "$f" | grep -c 'dnsfixDropRules' || true)" -gt 0 ]; then dns_state="yes"; else dns_state="NO"; echo "::warning::$abi: the DNS patch (dnsfixDropRules) is not linked into this core; the 'Legacy Address Filter Fields' error may come back. Read patch-dns-log.txt"; fi
+            fi
             soar_state="n/a"
             if [ "${SOAR_INJECTED:-0}" = 1 ] && [ -n "$SOAR_ZONE" ]; then
               if strings -a "$f" | grep -qF -- "$SOAR_ZONE"; then soar_state="yes"; else soar_state="NOT FOUND"; echo "::warning::$abi: the Soar zone was passed to the linker but is not visible in the binary (the variable may be unused or stored differently)"; fi
             fi
-            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | ${lb_in:-?} | ${LB_EXPECT:-?} | $soar_state | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "| $abi | $([ $has_tag = 1 ] && echo yes || echo NO) | $tun_refs | $socks_refs | ${lb_in:-?} | ${LB_EXPECT:-?} | $dns_state | $soar_state | $(sha256sum "$f" | cut -c1-16) |" | tee -a "$GITHUB_STEP_SUMMARY"
             if [ "$has_tag" != 1 ] || [ "$tun_refs" != 0 ]; then
               echo "::error::$abi liblantern_novpn.so is NOT a SOCKS-only build (tag present: $has_tag, TUN code references: $tun_refs)"
               bad=1
@@ -746,7 +852,11 @@ jobs:
             patch-log-fallback.txt
             patch-dns-log.txt
             patch-dns-fallback.txt
+            patch-quiet-log.txt
+            patch-quiet-fallback.txt
             dnsfix-compile.log
+            quiet-compile.log
+            quiet-kindling-compile.log
             core-info.txt
             go-mod.diff
             deps.log
