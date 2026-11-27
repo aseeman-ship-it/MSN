@@ -31,6 +31,8 @@ name: lantern-binaries
 #     slogWriter). Each edit is compiled right away and reverted when it does not compile. Warnings,
 #     errors and the milestones the app reads (tcp select / tcp switch / user failure / config fetched)
 #     stay at INFO. Also re-run after the lantern-box fallback.
+# 10. NEW: local_dns input (patch-localdns.sh): Quad9, the default resolver of 'dns_local', does not answer
+#     in Iran (field log: rule-set ga-ir never downloads, direct domains fail with EOF). Opt-in.
 #  9. NEW: verification also reports whether the DNS patch (dnsfixDropRules) is really linked into every
 #     binary, and dns-facts.txt now shows how Lantern picks its local DNS resolver (localDNSIP), which
 #     is what the "lookup ... exchange4: EOF" errors of Iranian (direct) domains come from.
@@ -65,6 +67,9 @@ on:
       dns_drop_rulesets:
         description: "Rule-set tags whose DNS rules are dropped at sing-box level (sing-box 1.14 rejects them: 'Legacy Address Filter Fields'). Comma separated; * = every DNS rule that uses a rule-set; empty = no patch"
         default: "*"
+      local_dns:
+        description: "Optional IP of the resolver Lantern uses for 'dns_local' (rule-set download, direct domains). Default Quad9 fails in Iran (EOF). Try 8.8.8.8 or 1.1.1.1; empty = unchanged"
+        default: ""
       quiet_logs:
         description: "Lower per-connection / DNS-race INFO lines of the core to DEBUG (patch-logquiet.sh). Turn off only to debug the core itself"
         type: boolean
@@ -101,6 +106,7 @@ env:
   GOFLAGS: -mod=mod
   DNS_DROP: ${{ inputs.dns_drop_rulesets }}
   QUIET_LOGS: ${{ inputs.quiet_logs }}
+  LOCAL_DNS: ${{ inputs.local_dns }}
 
 jobs:
   binary:
@@ -319,7 +325,12 @@ jobs:
             done < <(grep -rlE "$PAT" --include=*.go "$D" 2>/dev/null | grep -v _test.go)
             echo "$mod: $n file(s) changed"
             [ "$n" = 0 ] && return 0
-            if GODEBUG=goindex=0 go build -tags "$TAGS,$SOCKS_TAG" $(echo $pkgs | tr ' ' '\n' | sort -u) > quiet-compile.log 2>&1; then
+            # Only packages that really are part of this build (some protocols are behind tags that are off:
+            # building those would fail with "build constraints exclude all Go files" and undo a good patch).
+            BUILDABLE="$(go list -e -tags "$TAGS,$SOCKS_TAG" -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' $(echo $pkgs | tr ' ' '\n' | sort -u) 2>/dev/null | sort -u)"
+            if [ -z "$BUILDABLE" ]; then
+              echo "$mod: none of the touched packages is part of this build (tags): nothing to compile"
+            elif GODEBUG=goindex=0 go build -tags "$TAGS,$SOCKS_TAG" $BUILDABLE > quiet-compile.log 2>&1; then
               echo "$mod: compiles with the quiet patch"
             else
               echo "::warning::$mod: log patch did not compile; reverted. Send patch-quiet-log.txt"
@@ -353,6 +364,40 @@ jobs:
           done
           EOF
           chmod +x patch-logquiet.sh
+
+          # ---- patch-localdns.sh ----------------------------------------------------------
+          # Field log 2026-11-27 (core v0.0.249): "fetch rule-set ga-ir : lookup ...: (exchange6: EOF |
+          # exchange4: EOF)" and "lookup failed for [domain]: ... EOF". radiance vpn/dnsoptions.go
+          # localDNSIP() returns Quad9 for every locale except AliDNS-locales and RU; from Iran that
+          # resolver does not answer, so the ga-ir rule-set never downloads and every domain routed
+          # `direct` waits for a failing lookup. Opt-in (local_dns input): the default branch of
+          # localDNSIP returns the given IP. Compiled right away, reverted when it does not compile.
+          cat > patch-localdns.sh <<'EOF'
+          #!/usr/bin/env bash
+          set +e
+          IP="${LOCAL_DNS:-}"
+          if [ -z "$IP" ]; then echo "local_dns is empty: localDNSIP unchanged (Quad9 for en-US)"; exit 0; fi
+          if ! echo "$IP" | grep -qE '^[0-9A-Fa-f:.]+$'; then echo "::warning::local_dns '$IP' is not an IP address: skipped"; exit 0; fi
+          F="vpn/dnsoptions.go"
+          if [ ! -f "$F" ]; then echo "::warning::$F not found: local DNS patch skipped"; exit 0; fi
+          if grep -q 'nana-local-dns' "$F"; then echo "localDNSIP already patched"; exit 0; fi
+          cp "$F" "$F.localdns.bak"
+          perl -0pi -e 's/(func localDNSIP\(\) string \{.*?)\treturn quad9DNS\n/$1\treturn "'"$IP"'" \/\/ nana-local-dns\n/s' "$F"
+          if ! grep -q 'nana-local-dns' "$F"; then
+            echo "::warning::no 'return quad9DNS' inside localDNSIP: local DNS patch skipped. Send dns-facts.txt"
+            cp "$F.localdns.bak" "$F"; rm -f "$F.localdns.bak"; exit 0
+          fi
+          if GODEBUG=goindex=0 go build -tags "$TAGS,$SOCKS_TAG" ./vpn > localdns-compile.log 2>&1; then
+            echo "PATCHED radiance localDNSIP: default resolver is now $IP"
+            grep -n -B3 'nana-local-dns' "$F"
+          else
+            echo "::warning::local DNS patch did not compile; reverted. Send patch-localdns-log.txt"
+            tail -25 localdns-compile.log
+            cp "$F.localdns.bak" "$F"
+          fi
+          rm -f "$F.localdns.bak"
+          EOF
+          chmod +x patch-localdns.sh
 
           # ---- ci-build-core.sh -----------------------------------------------------------
           #   ./ci-build-core.sh <abi>      abi = arm64-v8a | armeabi-v7a | x86_64 | x86
@@ -419,6 +464,7 @@ jobs:
             ./patch-netmon.sh > patch-log-fallback.txt 2>&1 || true
             ./patch-dnsrules.sh > patch-dns-fallback.txt 2>&1 || true
             ./patch-logquiet.sh > patch-quiet-fallback.txt 2>&1 || true
+            ./patch-localdns.sh > patch-localdns-fallback.txt 2>&1 || true
             NEW_LB="$(go list -m -f '{{.Version}}' github.com/getlantern/lantern-box)"
             echo "LB_EXPECT=$NEW_LB" >> "$GITHUB_ENV"
             echo "LB_PINNED=0" >> "$GITHUB_ENV"
@@ -732,6 +778,9 @@ jobs:
       - name: Patch - quiet per-connection log lines (INFO to DEBUG)
         run: ./patch-logquiet.sh 2>&1 | tee patch-quiet-log.txt
 
+      - name: Patch - local DNS resolver for dns_local (opt-in, local_dns)
+        run: ./patch-localdns.sh 2>&1 | tee patch-localdns-log.txt
+
       - name: Build arm64-v8a SOCKS core -> liblantern_novpn.so (required)
         run: ./ci-build-core.sh arm64-v8a
 
@@ -854,6 +903,9 @@ jobs:
             patch-dns-fallback.txt
             patch-quiet-log.txt
             patch-quiet-fallback.txt
+            patch-localdns-log.txt
+            patch-localdns-fallback.txt
+            localdns-compile.log
             dnsfix-compile.log
             quiet-compile.log
             quiet-kindling-compile.log
